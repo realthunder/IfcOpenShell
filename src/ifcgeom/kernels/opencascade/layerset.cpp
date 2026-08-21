@@ -21,6 +21,11 @@
 #include <string>
 
 #include <Bnd_Box.hxx>
+#include <BRepGProp.hxx>
+#include <GProp_GProps.hxx>
+#include <GeomAPI_ProjectPointOnSurf.hxx>
+#include <GeomAdaptor_Surface.hxx>
+#include <gp_Pln.hxx>
 
 #include <BRepBuilderAPI_MakeShell.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
@@ -47,8 +52,50 @@ namespace {
 		}
 	}
 
+	// Which of the two pieces a single boundary divides a body into carries the
+	// first layer: the one nearer the first boundary. The many-boundary branch
+	// places pieces by index and gives style 0 to the piece that touches only
+	// boundary 1 -- the piece on the side boundary 0 is on -- and this is the
+	// same rule measured rather than assumed, because the dividing surface's
+	// normal does not point the same way for a plane lifted from a slab's
+	// extrusion as for a surface offset from a wall's axis. Assuming either
+	// sense swaps the two materials of every two-layer product of the other
+	// kind, which is invisible wherever both layers are the same thickness.
+	bool nearer_first_boundary(const TopoDS_Shape& a, const TopoDS_Shape& b, const opencascade::handle<Geom_Surface>& first) {
+		if (first.IsNull()) {
+			return true;
+		}
+		GProp_GProps ga, gb;
+		BRepGProp::VolumeProperties(a, ga);
+		BRepGProp::VolumeProperties(b, gb);
+		GeomAPI_ProjectPointOnSurf pa(ga.CentreOfMass(), first);
+		GeomAPI_ProjectPointOnSurf pb(gb.CentreOfMass(), first);
+		if (!pa.IsDone() || !pb.IsDone() || pa.NbPoints() == 0 || pb.NbPoints() == 0) {
+			return true;
+		}
+		return pa.LowerDistance() <= pb.LowerDistance();
+	}
+
+	// A shell cannot be divided into layers. Splitting a shell by a face only
+	// cuts the shell's own faces along the intersection curve -- it never adds
+	// a face lying on the cutting surface -- so every piece comes back with no
+	// face on any layer boundary and none of them can be placed. Close the body
+	// into a solid first, which is also what the two-layer path does by way of
+	// its half-space boolean.
+	TopoDS_Shape close_for_splitting(const TopoDS_Shape& shape, double tol) {
+		TopoDS_Shape sld = ifcopenshell::geom::util::ensure_fit_for_subtraction(shape, tol);
+		if (TopExp_Explorer(sld, TopAbs_SOLID).More() || !TopExp_Explorer(sld, TopAbs_SHELL).More()) {
+			return sld;
+		}
+		TopoDS_Shape solid;
+		if (ifcopenshell::geom::util::create_solid_from_compound(sld, solid, tol) && TopExp_Explorer(solid, TopAbs_SOLID).More()) {
+			return solid;
+		}
+		return sld;
+	}
+
 #if OCC_VERSION_HEX >= 0x70200
-    bool split(const TopoDS_Shape& input, const NCollection_List<TopoDS_Shape>& operands, double eps, std::vector<TopoDS_Shape>& slices) {
+    bool split(const TopoDS_Shape& input, const NCollection_List<TopoDS_Shape>& operands, double eps, std::vector<std::vector<TopoDS_Shape>>& slices) {
 		if (operands.Extent() < 2) {
 			// Needs to have at least two cutting surfaces for the ordering based on surface containment to work.
 			return false;
@@ -89,8 +136,18 @@ namespace {
 				subshapes(s, subs);
 			}
 
-			// Initialize storage
-			slices.resize(subs.size());
+			// One bucket per layer, not per piece. A layer is not always a
+			// single piece: an opening, or anything else that divides the body
+			// across its whole thickness, leaves each layer in several pieces,
+			// and they all belong to the same material. Sizing this by the
+			// piece count instead made every such body fail -- the second piece
+			// of a layer found the bucket taken and the whole product was
+			// handed back unsliced.
+			slices.resize(operands.Extent() + 1);
+
+			// Count the ways a piece failed to place, so that a refusal says
+			// which of them happened rather than only that one did.
+			int unmatched = 0, spanning = 0, empty_layers = 0;
 
 			for (auto& s : subs) {
 
@@ -127,25 +184,80 @@ namespace {
 					}
 				}
 
-				if (idx < (int)slices.size()) {
-					if (slices[idx].IsNull()) {
-						slices[idx] = s;
-						continue;
-					}
+				if (idx >= 0 && idx < (int)slices.size()) {
+					slices[idx].push_back(s);
+					continue;
 				}
 
 				// A piece could not be placed. Pieces are placed by which
 				// cutting surface their faces sit on, compared by surface
-				// object, and the splitter only hands back the object it was
-				// given where it had no reason to rebuild the face -- which it
-				// does have when the surface is periodic. So a curved layer
-				// boundary loses every piece here and the body stays whole.
-				// Ordering the pieces by where they sit instead looks like the
-				// fix and was tried: it admits pieces that are not layers, on
-				// bodies whose own thickness does not match the layer set they
-				// carry, so it needs a check that the pieces are the declared
-				// thicknesses before it can be trusted.
-				ifcopenshell::logger::root().error("GEO", 171, "Unable to map layer geometry to material index");
+				// object, which holds as long as the splitter hands back the
+				// object it was given -- it does not when it has had to rebuild
+				// the face. Ordering the pieces by where they sit instead was
+				// tried and taken back out: it admits pieces that are not
+				// layers, on bodies whose own thickness does not match the
+				// layer set they carry. What guards that case now is the
+				// thickness check the kernel runs over the finished slices.
+				if (min == std::numeric_limits<int>::max()) {
+					// No face of this piece sits on any cutting surface.
+					++unmatched;
+				} else {
+					// Its faces sit on boundaries that are not neighbours, so
+					// it is not one layer thick.
+					++spanning;
+				}
+			}
+
+			for (auto& bucket : slices) {
+				if (bucket.empty()) {
+					++empty_layers;
+				}
+			}
+
+			if (unmatched || spanning || empty_layers) {
+				// Where each cutting surface sat relative to the body: the
+				// signed distance from its plane to the body's furthest points
+				// either side. A boundary that does not straddle zero never
+				// had anything to cut.
+				std::string reach;
+				for (NCollection_List<TopoDS_Shape>::Iterator oit(operands); oit.More(); oit.Next()) {
+					TopExp_Explorer fe(oit.Value(), TopAbs_FACE);
+					if (!fe.More()) {
+						continue;
+					}
+					auto srf = BRep_Tool::Surface(TopoDS::Face(fe.Current()));
+					GeomAdaptor_Surface ga(srf);
+					if (ga.GetType() != GeomAbs_Plane) {
+						reach += " (not a plane)";
+						continue;
+					}
+					gp_Pln pln = ga.Plane();
+					double dmin = std::numeric_limits<double>::max();
+					double dmax = -std::numeric_limits<double>::max();
+					for (TopExp_Explorer ve(input, TopAbs_VERTEX); ve.More(); ve.Next()) {
+						double d = pln.SignedDistance(BRep_Tool::Pnt(TopoDS::Vertex(ve.Current())));
+						dmin = std::min(dmin, d);
+						dmax = std::max(dmax, d);
+					}
+					reach += " [" + std::to_string(dmin) + "," + std::to_string(dmax) + "]";
+				}
+
+				std::string kinds;
+				for (auto& s : subs) {
+					int nf = 0;
+					for (TopExp_Explorer e(s, TopAbs_FACE); e.More(); e.Next(), ++nf) {}
+					kinds += " " + std::to_string((int)s.ShapeType()) + "/" + std::to_string(nf) + "f";
+				}
+				ifcopenshell::logger::root().error("GEO", 171,
+					"Unable to map layer geometry to material index: " +
+					std::to_string(subs.size()) + " pieces for " +
+					std::to_string(operands.Extent() + 1) + " layers, of which " +
+					std::to_string(unmatched) + " on no boundary and " +
+					std::to_string(spanning) + " not between neighbouring boundaries, leaving " +
+					std::to_string(empty_layers) + " layers with no piece" +
+					" [input type " + std::to_string((int)input.ShapeType()) +
+					", " + std::to_string(surfaces.size()) + " boundary faces; pieces type/faces:" + kinds +
+					"; body either side of each boundary:" + reach + "]");
 				return false;
 			}
 		}
@@ -153,7 +265,7 @@ namespace {
 		return true;
 	}
 #else
-	bool split(const TopoDS_Shape& input, const TopTools_ListOfShape& operands, double, std::vector<TopoDS_Shape>& slices) {
+	bool split(const TopoDS_Shape& input, const TopTools_ListOfShape& operands, double, std::vector<std::vector<TopoDS_Shape>>& slices) {
 		TopTools_ListIteratorOfListOfShape it(operands);
 		TopoDS_Shape i = input;
 		for (; it.More(); it.Next()) {
@@ -167,13 +279,13 @@ namespace {
 
 			if ((s.ShapeType() == TopAbs_FACE && ifcopenshell::geom::util::split_solid_by_surface(i, surf, a, b)) ||
 				(s.ShapeType() == TopAbs_SHELL && ifcopenshell::geom::util::split_solid_by_shell(i, s, a, b))) {
-				slices.push_back(b);
+				slices.push_back({ b });
 				i = a;
 			} else {
 				return false;
 			}
 		}
-		slices.push_back(i);
+		slices.push_back({ i });
 		return true;
 	}
 #endif
@@ -265,8 +377,15 @@ bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversio
 		for (std::vector<conversion_result>::const_iterator it = items.begin(); it != items.end(); ++it) {
 			TopoDS_Shape a, b;
 			if (split_solid_by_shell(std::static_pointer_cast<open_cascade_shape>(it->shape())->shape(), shells.First(), a, b, tol)) {
-				result.push_back(conversion_result(it->ItemId(), it->placement(), new open_cascade_shape(b), (!!styles[0] ? styles[0] : it->style_ptr())));
-				result.push_back(conversion_result(it->ItemId(), it->placement(), new open_cascade_shape(a), (!!styles[1] ? styles[1] : it->style_ptr())));
+				opencascade::handle<Geom_Surface> first;
+				if (!surfaces.empty() && !surfaces.front().empty()) {
+					first = surfaces.front().front();
+				}
+				const bool a_is_first = nearer_first_boundary(a, b, first);
+				const TopoDS_Shape& s0 = a_is_first ? a : b;
+				const TopoDS_Shape& s1 = a_is_first ? b : a;
+				result.push_back(conversion_result(it->ItemId(), it->placement(), new open_cascade_shape(s0), (!!styles[0] ? styles[0] : it->style_ptr())));
+				result.push_back(conversion_result(it->ItemId(), it->placement(), new open_cascade_shape(s1), (!!styles[1] ? styles[1] : it->style_ptr())));
 			} else {
 				continue;
 			}
@@ -279,12 +398,14 @@ bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversio
 		for (std::vector<conversion_result>::const_iterator it = items.begin(); it != items.end(); ++it) {
 
 			const TopoDS_Shape& s = std::static_pointer_cast<open_cascade_shape>(it->shape())->shape();
-			TopoDS_Shape sld = ensure_fit_for_subtraction(s, tol);
+			TopoDS_Shape sld = close_for_splitting(s, tol);
 
-			std::vector<TopoDS_Shape> slices;
-			if (split(s, shells, tol, slices) && slices.size() == styles.size()) {
+			std::vector<std::vector<TopoDS_Shape>> slices;
+			if (split(sld, shells, tol, slices) && slices.size() == styles.size()) {
 				for (size_t i = 0; i < slices.size(); ++i) {
-					result.push_back(conversion_result(it->ItemId(), it->placement(), new open_cascade_shape(slices[i]), (!!styles[i] ? styles[i] : it->style_ptr())));
+					for (auto& piece : slices[i]) {
+						result.push_back(conversion_result(it->ItemId(), it->placement(), new open_cascade_shape(piece), (!!styles[i] ? styles[i] : it->style_ptr())));
+					}
 				}
 			} else {
 				return false;
@@ -307,13 +428,16 @@ bool ifcopenshell::geom::util::apply_layerset(const std::vector<conversion_resul
 		for (std::vector<conversion_result>::const_iterator it = items.begin(); it != items.end(); ++it) {
 			TopoDS_Shape a, b;
 			if (split_solid_by_surface(std::static_pointer_cast<open_cascade_shape>(it->shape())->shape(), surfaces[1], a, b, tol)) {
-				result.push_back(conversion_result(it->ItemId(), it->placement(),new open_cascade_shape(b), (!!styles[0] ? styles[0] : it->style_ptr())));
-				result.push_back(conversion_result(it->ItemId(), it->placement(),new open_cascade_shape(a), (!!styles[1] ? styles[1] : it->style_ptr())));
+				const bool a_is_first = nearer_first_boundary(a, b, surfaces[0]);
+				const TopoDS_Shape& s0 = a_is_first ? a : b;
+				const TopoDS_Shape& s1 = a_is_first ? b : a;
+				result.push_back(conversion_result(it->ItemId(), it->placement(),new open_cascade_shape(s0), (!!styles[0] ? styles[0] : it->style_ptr())));
+				result.push_back(conversion_result(it->ItemId(), it->placement(),new open_cascade_shape(s1), (!!styles[1] ? styles[1] : it->style_ptr())));
 			} else {
 				// Skipping the item would report success while handing back a
 				// result this body is missing from, and the caller has no way
 				// to tell that from a body that was genuinely divided.
-				ifcopenshell::logger::root().warning("GEO", 326, "Unable to divide a body by its single layer boundary");
+				ifcopenshell::logger::root().warning("GEO", 334, "Unable to divide a body by its single layer boundary");
 				return false;
 			}
 		}
@@ -354,18 +478,16 @@ bool ifcopenshell::geom::util::apply_layerset(const std::vector<conversion_resul
 		for (std::vector<conversion_result>::const_iterator it = items.begin(); it != items.end(); ++it) {
 
 			const TopoDS_Shape& s = std::static_pointer_cast<open_cascade_shape>(it->shape())->shape();
-			TopoDS_Shape sld = ensure_fit_for_subtraction(s, tol);
-
+			TopoDS_Shape sld = close_for_splitting(s, tol);
 			NCollection_List<TopoDS_Shape> operands;
 			for (unsigned i = 1; i < surfaces.size() - 1; ++i) {
 				double u1, v1, u2, v2;
 				if (!project(surfaces[i], sld, u1, v1, u2, v2)) {
-					ifcopenshell::logger::root().warning("GEO", 324, "Unable to fit layer boundary " + std::to_string(i) + " of " + std::to_string(surfaces.size()) + " to the body it divides");
+					ifcopenshell::logger::root().warning("GEO", 332, "Unable to fit layer boundary " + std::to_string(i) + " of " + std::to_string(surfaces.size()) + " to the body it divides");
 					return false;
 				}
 
 				TopoDS_Face face = BRepBuilderAPI_MakeFace(surfaces[i], u1, u2, v1, v2, 1.e-7).Face();
-
 				operands.Append(face);
 			}
 
@@ -376,13 +498,15 @@ bool ifcopenshell::geom::util::apply_layerset(const std::vector<conversion_resul
 			}
 			*/
 
-			std::vector<TopoDS_Shape> slices;
-			if (split(s, operands, tol, slices) && slices.size() == styles.size()) {
+			std::vector<std::vector<TopoDS_Shape>> slices;
+			if (split(sld, operands, tol, slices) && slices.size() == styles.size()) {
 				for (size_t i = 0; i < slices.size(); ++i) {
-					result.push_back(conversion_result(it->ItemId(), it->placement(), new open_cascade_shape(slices[i]), (!!styles[i] ? styles[i] : it->style_ptr())));
+					for (auto& piece : slices[i]) {
+						result.push_back(conversion_result(it->ItemId(), it->placement(), new open_cascade_shape(piece), (!!styles[i] ? styles[i] : it->style_ptr())));
+					}
 				}
 			} else {
-				ifcopenshell::logger::root().warning("GEO", 325, "Splitting a body by " + std::to_string(operands.Extent()) + " layer boundaries did not give one piece per layer");
+				ifcopenshell::logger::root().warning("GEO", 333, "Splitting a body by " + std::to_string(operands.Extent()) + " layer boundaries did not give one piece for each of its " + std::to_string(styles.size()) + " layers");
 				return false;
 			}
 		}

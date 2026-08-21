@@ -1207,10 +1207,18 @@ bool mapping::get_layerset_information(const express::base& p, layerset_informat
 
             offset += thickness;
 
-            auto offset_matrix = taxonomy::make<taxonomy::matrix4>();
-            offset_matrix->components()(2, 3) = offset;
-            offset_matrix->components()(3, 3) = 1.;
-            offset_matrix->components() *= extrusion_position->components();
+            // The layer boundary is offset along the extrusion's own axis, so
+            // the offset composes on the right of the placement. On the left it
+            // translates along the global Z instead, and for a body whose
+            // placement flips Z -- as an IfcExtrudedAreaSolid commonly does --
+            // that puts the whole layer stack on the far side of the body. The
+            // splitter then has nothing to cut and hands the body back whole.
+            Eigen::Matrix4d along_axis = Eigen::Matrix4d::Identity();
+            along_axis(2, 3) = offset;
+            Eigen::Matrix4d placed = extrusion_position
+                ? Eigen::Matrix4d(extrusion_position->ccomponents() * along_axis)
+                : along_axis;
+            auto offset_matrix = taxonomy::make<taxonomy::matrix4>(placed);
 
             auto pln = taxonomy::make<taxonomy::plane>();
             pln->matrix = offset_matrix;

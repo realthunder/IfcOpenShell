@@ -48,6 +48,14 @@
 
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepGProp.hxx>
+#include <BRep_Tool.hxx>
+#include <GeomAPI_ProjectPointOnSurf.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopoDS.hxx>
+#include <TopoDS_Vertex.hxx>
+#include <TopoDS_Edge.hxx>
+#include <Geom_Curve.hxx>
+#include <limits>
 #include <GProp_GProps.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <Geom_CylindricalSurface.hxx>
@@ -206,6 +214,55 @@ namespace {
 #endif
 	}
 
+	// Where a piece sits across the layer stack, as a distance from the first
+	// boundary. Every boundary is an offset of the same basis -- parallel
+	// planes for a slab, coaxial cylinders for a curved wall -- so this single
+	// coordinate places a piece in the stack whatever the boundaries are.
+	bool extent_across_layers(const TopoDS_Shape& shape, const Handle(Geom_Surface)& first, double& lo, double& hi) {
+		lo = std::numeric_limits<double>::max();
+		hi = -std::numeric_limits<double>::max();
+		int n = 0;
+
+		auto sample = [&first, &lo, &hi](const gp_Pnt& p) {
+			GeomAPI_ProjectPointOnSurf proj(p, first);
+			if (!proj.IsDone() || proj.NbPoints() == 0) {
+				return false;
+			}
+			const double d = proj.LowerDistance();
+			lo = std::min(lo, d);
+			hi = std::max(hi, d);
+			return true;
+		};
+
+		for (TopExp_Explorer exp(shape, TopAbs_VERTEX); exp.More(); exp.Next(), ++n) {
+			if (!sample(BRep_Tool::Pnt(TopoDS::Vertex(exp.Current())))) {
+				return false;
+			}
+		}
+
+		// Along the edges as well, not only at their ends. A split by a curved
+		// boundary can leave a piece carrying a face whose edge runs off as a
+		// straight chord while its two vertices stay where they belong -- a fin
+		// of no volume, so neither the vertices nor the volume of the slices
+		// show it, and only a point taken between the ends does.
+		for (TopExp_Explorer exp(shape, TopAbs_EDGE); exp.More(); exp.Next()) {
+			double a, b;
+			opencascade::handle<Geom_Curve> crv = BRep_Tool::Curve(TopoDS::Edge(exp.Current()), a, b);
+			if (crv.IsNull()) {
+				continue;
+			}
+			for (int k = 1; k < 4; ++k) {
+				gp_Pnt p;
+				crv->D0(a + (b - a) * k / 4., p);
+				if (!sample(p)) {
+					return false;
+				}
+			}
+		}
+
+		return n > 0;
+	}
+
 	double total_volume(const std::vector<conversion_result>& items) {
 		double v = 0.;
 		for (auto& item : items) {
@@ -229,7 +286,7 @@ bool open_cascade_kernel::apply_layerset(std::vector<conversion_result>& items, 
 	for (auto& layer : info.layers) {
 		auto s = boundary_surface(this, layer, precision_);
 		if (s.IsNull()) {
-			logger_.message(ifcopenshell::logger::LOG_WARNING, "GEO", 323,
+			logger_.message(ifcopenshell::logger::LOG_WARNING, "GEO", 330,
 				"Unable to build a surface for a material layer boundary of kind "
 					+ taxonomy::kind_to_string(layer->kind()) + ", the body is left unsliced");
 			return false;
@@ -255,9 +312,44 @@ bool open_cascade_kernel::apply_layerset(std::vector<conversion_result>& items, 
 	const double before = total_volume(items);
 	const double after = total_volume(sliced);
 	if (before <= 0. || std::fabs(after - before) > 1.e-3 * before) {
-		logger_.message(ifcopenshell::logger::LOG_WARNING, "GEO", 327,
+		logger_.message(ifcopenshell::logger::LOG_WARNING, "GEO", 331,
 			"Material layer slices do not add up to the body they came from, leaving it unsliced");
 		return false;
+	}
+
+	// Every piece has to span exactly one declared layer, measured across the
+	// boundaries. Without this a body that is not the thickness of its own
+	// layer set still divides, and the outermost piece silently absorbs all
+	// the material the layer set never described -- King has curved walls
+	// whose bodies are twenty-eight times their layer set, which came out as
+	// two right layers and one 11-unit one against a declared 0.0625. The
+	// volume guard above does not see this: the pieces do add up to the body.
+	std::vector<double> cumulative(1, 0.);
+	for (auto& t : info.thicknesses) {
+		cumulative.push_back(cumulative.back() + t);
+	}
+
+	if (cumulative.size() == surfaces.size()) {
+		const double band_tol = std::max(precision_ * 10., cumulative.back() * 1.e-3);
+		for (auto& piece : sliced) {
+			double lo, hi;
+			const TopoDS_Shape& shape = std::static_pointer_cast<open_cascade_shape>(piece.shape())->shape();
+			bool spans_a_layer = false;
+			if (extent_across_layers(shape, surfaces.front(), lo, hi)) {
+				for (size_t i = 0; i + 1 < cumulative.size(); ++i) {
+					if (std::fabs(lo - cumulative[i]) <= band_tol && std::fabs(hi - cumulative[i + 1]) <= band_tol) {
+						spans_a_layer = true;
+						break;
+					}
+				}
+			}
+			if (!spans_a_layer) {
+				logger_.message(ifcopenshell::logger::LOG_WARNING, "GEO", 335,
+					"A material layer slice measures " + std::to_string(hi - lo) +
+					" across the boundaries, which is not the thickness of any declared layer, leaving the body unsliced");
+				return false;
+			}
+		}
 	}
 
 	items.swap(sliced);
