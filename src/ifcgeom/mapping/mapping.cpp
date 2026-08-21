@@ -881,8 +881,26 @@ void mapping::initialize_units_() {
     if (projects.size() == 1) {
         auto& project = projects.front();
         unit_assignment = project.UnitsInContext();
+    } else if (projects.empty()) {
+        logger_.warning("GEO", 308, "No project or context in file");
     } else {
-        logger_.warning("GEO", 308, "Not a single project or context in file");
+        // A federated file carries one context per model it was assembled
+        // from, and they normally agree. Giving up here left the plane angle
+        // unit undefined, so a file whose trim parameters are in degrees had
+        // every arc read as radians: the profile no longer closed, the wire
+        // builder bridged the ends with straight segments, and the body came
+        // out self-intersecting with faces that will not even triangulate.
+        // Take the units of the first context that declares any, and warn
+        // that the others are ignored. Comparing them all would be better,
+        // but this translation unit is already at the linker's reach for a
+        // PLT32 relocation and the extra instantiation does not fit.
+        for (auto& project : projects) {
+            if (auto assignment = project.UnitsInContext()) {
+                unit_assignment = assignment;
+                break;
+            }
+        }
+        logger_.warning("GEO", 308, "More than one project or context in file; using the units of the first that declares any and ignoring the rest");
     }
     if (!unit_assignment) {
         logger_.warning("GEO", 309, "Unable to detect unit information");

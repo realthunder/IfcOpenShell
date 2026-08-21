@@ -55,6 +55,8 @@
 #include <TopoDS_Vertex.hxx>
 #include <TopoDS_Edge.hxx>
 #include <Geom_Curve.hxx>
+#include <GeomAdaptor_Curve.hxx>
+#include <string>
 #include <limits>
 #include <GProp_GProps.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
@@ -218,12 +220,13 @@ namespace {
 	// boundary. Every boundary is an offset of the same basis -- parallel
 	// planes for a slab, coaxial cylinders for a curved wall -- so this single
 	// coordinate places a piece in the stack whatever the boundaries are.
-	bool extent_across_layers(const TopoDS_Shape& shape, const Handle(Geom_Surface)& first, double& lo, double& hi) {
+	bool extent_across_layers(const TopoDS_Shape& shape, const Handle(Geom_Surface)& first, double& lo, double& hi, std::string* worst = nullptr) {
 		lo = std::numeric_limits<double>::max();
 		hi = -std::numeric_limits<double>::max();
 		int n = 0;
 
-		auto sample = [&first, &lo, &hi](const gp_Pnt& p) {
+		double worst_d = -1.;
+		auto sample = [&](const gp_Pnt& p, const char* what, double detail) {
 			GeomAPI_ProjectPointOnSurf proj(p, first);
 			if (!proj.IsDone() || proj.NbPoints() == 0) {
 				return false;
@@ -231,11 +234,16 @@ namespace {
 			const double d = proj.LowerDistance();
 			lo = std::min(lo, d);
 			hi = std::max(hi, d);
+			if (worst && d > worst_d) {
+				worst_d = d;
+				*worst = std::string(what) + " " + std::to_string(detail) + " at " + std::to_string(d) +
+					" (" + std::to_string(p.X()) + ", " + std::to_string(p.Y()) + ", " + std::to_string(p.Z()) + ")";
+			}
 			return true;
 		};
 
 		for (TopExp_Explorer exp(shape, TopAbs_VERTEX); exp.More(); exp.Next(), ++n) {
-			if (!sample(BRep_Tool::Pnt(TopoDS::Vertex(exp.Current())))) {
+			if (!sample(BRep_Tool::Pnt(TopoDS::Vertex(exp.Current())), "vertex", 0.)) {
 				return false;
 			}
 		}
@@ -251,10 +259,11 @@ namespace {
 			if (crv.IsNull()) {
 				continue;
 			}
+			GeomAdaptor_Curve gac(crv);
 			for (int k = 1; k < 4; ++k) {
 				gp_Pnt p;
 				crv->D0(a + (b - a) * k / 4., p);
-				if (!sample(p)) {
+				if (!sample(p, "edge of curve kind", (double)gac.GetType() * 10 + k)) {
 					return false;
 				}
 			}
@@ -299,6 +308,34 @@ bool open_cascade_kernel::apply_layerset(std::vector<conversion_result>& items, 
 		styles.push_back(taxonomy::make<taxonomy::style>(style));
 	}
 
+	// The body itself has to be the thickness of its own layer set before there
+	// is any point dividing it. Bodies that are not are common -- King has a
+	// wall 48 units thick carrying a 0.4167 layer set -- and slicing one hands
+	// back an outermost piece that silently absorbs everything the layer set
+	// never described.
+	std::vector<double> declared(1, 0.);
+	for (auto& t : info.thicknesses) {
+		declared.push_back(declared.back() + t);
+	}
+	const double band_tol = std::max(precision_ * 10., declared.back() * 1.e-3);
+
+	if (declared.size() == surfaces.size()) {
+		for (auto& item : items) {
+			double lo, hi;
+			std::string worst;
+			const TopoDS_Shape& shape = std::static_pointer_cast<open_cascade_shape>(item.shape())->shape();
+			if (!extent_across_layers(shape, surfaces.front(), lo, hi, &worst) ||
+				std::fabs(lo) > band_tol || std::fabs(hi - declared.back()) > band_tol) {
+				logger_.message(ifcopenshell::logger::LOG_WARNING, "GEO", 337,
+					"The body measures " + std::to_string(lo) + ".." + std::to_string(hi) +
+					" across its own layer boundaries, not 0.." + std::to_string(declared.back()) +
+					", so its material layer set does not describe it and it is left unsliced"
+					" [furthest point: " + worst + "]");
+				return false;
+			}
+		}
+	}
+
 	std::vector<conversion_result> sliced;
 	if (!util::apply_layerset(items, surfaces, styles, sliced, precision_)) {
 		return false;
@@ -324,18 +361,15 @@ bool open_cascade_kernel::apply_layerset(std::vector<conversion_result>& items, 
 	// whose bodies are twenty-eight times their layer set, which came out as
 	// two right layers and one 11-unit one against a declared 0.0625. The
 	// volume guard above does not see this: the pieces do add up to the body.
-	std::vector<double> cumulative(1, 0.);
-	for (auto& t : info.thicknesses) {
-		cumulative.push_back(cumulative.back() + t);
-	}
+	const std::vector<double>& cumulative = declared;
 
 	if (cumulative.size() == surfaces.size()) {
-		const double band_tol = std::max(precision_ * 10., cumulative.back() * 1.e-3);
 		for (auto& piece : sliced) {
 			double lo, hi;
 			const TopoDS_Shape& shape = std::static_pointer_cast<open_cascade_shape>(piece.shape())->shape();
 			bool spans_a_layer = false;
-			if (extent_across_layers(shape, surfaces.front(), lo, hi)) {
+			std::string worst;
+			if (extent_across_layers(shape, surfaces.front(), lo, hi, &worst)) {
 				for (size_t i = 0; i + 1 < cumulative.size(); ++i) {
 					if (std::fabs(lo - cumulative[i]) <= band_tol && std::fabs(hi - cumulative[i + 1]) <= band_tol) {
 						spans_a_layer = true;
@@ -345,8 +379,9 @@ bool open_cascade_kernel::apply_layerset(std::vector<conversion_result>& items, 
 			}
 			if (!spans_a_layer) {
 				logger_.message(ifcopenshell::logger::LOG_WARNING, "GEO", 335,
-					"A material layer slice measures " + std::to_string(hi - lo) +
-					" across the boundaries, which is not the thickness of any declared layer, leaving the body unsliced");
+					"A material layer slice measures " + std::to_string(lo) + ".." + std::to_string(hi) +
+					" across the boundaries, which is not the thickness of any declared layer, leaving the body unsliced"
+					" [furthest point: " + worst + "]");
 				return false;
 			}
 		}

@@ -172,7 +172,9 @@ void ifcopenshell::geom::util::wire_builder::operator()(const TopoDS_Shape& a, c
 	if (dist > 1000. * p_) {
 		mw_.Add(w1);
 		mw_.Add(BRepBuilderAPI_MakeEdge(p1, p2));
-		ifcopenshell::logger::root().warning("GEO", 208, "Added additional segment to close gap with length " + boost::lexical_cast<std::string>(dist) + " to:", inst_);
+		ifcopenshell::logger::root().warning("GEO", 208, "Added additional segment to close gap with length " + boost::lexical_cast<std::string>(dist) +
+			" from (" + boost::lexical_cast<std::string>(p1.X()) + ", " + boost::lexical_cast<std::string>(p1.Y()) + ", " + boost::lexical_cast<std::string>(p1.Z()) +
+			") to (" + boost::lexical_cast<std::string>(p2.X()) + ", " + boost::lexical_cast<std::string>(p2.Y()) + ", " + boost::lexical_cast<std::string>(p2.Z()) + ") to:", inst_);
 		goto check;
 	}
 
