@@ -17,8 +17,10 @@
 #include <ShapeAnalysis_Surface.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <Standard_Version.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
+#include <BOPAlgo_GlueEnum.hxx>
 #include <BOPAlgo_PaveFiller.hxx>
 #include <BOPAlgo_Alerts.hxx>
 #include <ShapeFix_Shape.hxx>
@@ -27,6 +29,8 @@
 #include <ShapeAnalysis_Edge.hxx>
 #include <Bnd_OBB.hxx>
 
+#include <cmath>
+#include <algorithm>
 #include <vector>
 #include <thread>
 
@@ -832,6 +836,20 @@ bool ifcopenshell::geom::util::points_on_planar_face_generator::operator()(gp_Pn
 }
 
 
+namespace {
+	// Volume of a solid, for the material-conservation check below. Returns 0
+	// for shapes that enclose nothing, which is why the check stands down when
+	// the first operand is a sheet of faces rather than a solid.
+	double shape_volume(const TopoDS_Shape& s) {
+		if (s.IsNull()) {
+			return 0.;
+		}
+		GProp_GProps props;
+		BRepGProp::VolumeProperties(s, props);
+		return props.Mass();
+	}
+}
+
 bool ifcopenshell::geom::util::boolean_operation(const boolean_settings& settings, const TopoDS_Shape& a_input, const NCollection_List<TopoDS_Shape>& b_input, BOPAlgo_Operation op, TopoDS_Shape& result, double fuzziness) {
 	using namespace std::string_literals;
 
@@ -1050,9 +1068,16 @@ bool ifcopenshell::geom::util::boolean_operation(const boolean_settings& setting
 		if (is_extrusion_a) {
 			settings.log().notice("GEO", 136, "Operand A 1/1 is an extrusion");
 
+			// Second operands that are extrusions along the same direction,
+			// paired with the interval of A's axis that each one occupies.
+			struct b_extrusion {
+				std::pair<double, double> interval;
+				TopoDS_Face face;
+			};
+			std::vector<b_extrusion> b_extrusions;
+
 			NCollection_List<TopoDS_Shape>::Iterator it(b);
 			for (int nb = 1; it.More(); it.Next(), ++nb) {
-				bool process_2d = false;
 				TopoDS_Face b_face;
 				std::pair<double, double> b_interval;
 
@@ -1065,65 +1090,179 @@ bool ifcopenshell::geom::util::boolean_operation(const boolean_settings& setting
 
 				if (is_extrusion_b) {
 					settings.log().notice("GEO", 137, "Operand B " + std::to_string(nb) + "/" + std::to_string(b.Extent()) + " is an extrusion");
-
-					if (b_interval.first < a_interval.first + (fuzz * 100.) && b_interval.second > a_interval.second - (fuzz * 100.)) {
-						settings.log().notice("GEO", 138, "Operand B creates a through hole");
-
-						// Align b with a operand
-						gp_Trsf trsf;
-						trsf.SetTranslation(gp_Vec(gp::DY()) * (a_interval.first - b_interval.first));
-
-						b_faces.Append(b_face.Moved(trsf));
-						process_2d = true;
-					}
-				}
-
-				if (!process_2d) {
+					b_extrusions.push_back({ b_interval, b_face });
+				} else {
 					b_remainder_3d.Append(it.Value());
 				}
 			}
 
-			if (b_faces.Extent()) {
-				TopoDS_Shape face_result;
+			// Where an operand runs the full depth of A the subtraction is a
+			// single 2D problem: cut the profiles, extrude the result once.
+			// An operand that stops short -- a blind pocket, which is what a
+			// reveal or a wall sweep exports as -- used to be handed to the 3D
+			// kernel instead, and on the 210 King facade wall that meant 202
+			// pockets in one BRepAlgoAPI_Cut: 33.8s to fail, six times over at
+			// rising fuzziness, 179s to end up with the wall uncut.
+			//
+			// Pockets are still a 2D problem, just not a single one. Cutting
+			// A's interval at every interval endpoint gives slabs over which
+			// the set of active operands does not change, so each slab is one
+			// 2D subtraction and one extrusion, and the slabs stack into the
+			// result along coincident planar faces -- which is what gluing a
+			// fuse is for.
+			const double interval_eps = fuzz * 100.;
 
-				bool boolean_op_2d_success;
-				{
-					PERF("boolean operation: 2d builder");
-					// First try using face builder
+			std::vector<double> cuts;
+			cuts.push_back(a_interval.first);
+			cuts.push_back(a_interval.second);
+			for (const auto& be : b_extrusions) {
+				for (double v : { be.interval.first, be.interval.second }) {
+					if (v > a_interval.first + interval_eps && v < a_interval.second - interval_eps) {
+						cuts.push_back(v);
+					}
+				}
+			}
+			std::sort(cuts.begin(), cuts.end());
+			cuts.erase(std::unique(cuts.begin(), cuts.end(),
+				[interval_eps](double x, double y) { return std::fabs(x - y) <= interval_eps; }), cuts.end());
 
-					boolean_op_2d_success = boolean_subtraction_2d_using_builder(a_face, b_faces, face_result, fuzziness, settings.log());
+			// A wall with a hundred pockets at a hundred different depths would
+			// make a hundred slabs to fuse back together, which is no longer
+			// obviously the cheaper way round. Leave those to the 3D kernel.
+			static const size_t max_slabs = 64;
+
+			if (b_extrusions.empty()) {
+				settings.log().notice("GEO", 143, "No second operands can be processed as 2D inner bounds. Retrying in 3D.");
+			} else if (cuts.size() > max_slabs + 1) {
+				settings.log().notice("GEO", 156, "Too many distinct operand depths (" + std::to_string(cuts.size() - 1) + " slabs) to process in 2D. Retrying in 3D.");
+				b_remainder_3d = b;
+			} else {
+				if (cuts.size() > 2) {
+					settings.log().notice("GEO", 157, "Processing " + std::to_string(b_extrusions.size()) + " operands as " + std::to_string(cuts.size() - 1) + " slabs");
 				}
 
-				if (!boolean_op_2d_success) {
-					PERF("boolean operation: 2d");
-					// Retry using generic 2d using boolean algo on faces
+				auto subtract_2d = [&](std::vector<size_t>& active, TopoDS_Shape& face_result) {
+					NCollection_List<TopoDS_Shape> b_faces;
+					for (size_t k : active) {
+						gp_Trsf trsf;
+						trsf.SetTranslation(gp_Vec(gp::DY()) * (a_interval.first - b_extrusions[k].interval.first));
+						b_faces.Append(b_extrusions[k].face.Moved(trsf));
+					}
 
-					boolean_op_2d_success = boolean_operation(settings, a_face, b_faces, op, face_result, fuzziness);
-				}
+					if (b_faces.IsEmpty()) {
+						face_result = a_face;
+						return true;
+					}
 
-				if (boolean_op_2d_success) {
-					PERF("boolean operation: 2d to 3d");
+					{
+						PERF("boolean operation: 2d builder");
 
-					BRepPrimAPI_MakePrism mp(face_result, gp_Vec(gp::DY()) * (a_interval.second - a_interval.first));
-					if (mp.IsDone()) {
-						if (b_remainder_3d.Extent()) {
-							settings.log().notice("GEO", 139, std::to_string(b_remainder_3d.Extent()) + " operands remaining to process in 3D");
-							b = b_remainder_3d;
-							s1s.Clear();
-							s1s.Append(mp.Shape());
-						} else {
-							settings.log().notice("GEO", 140, "Processed fully in 2D");
-							result = mp.Shape();
+						if (boolean_subtraction_2d_using_builder(a_face, b_faces, face_result, fuzziness, settings.log())) {
 							return true;
 						}
-					} else {
+					}
+
+					PERF("boolean operation: 2d");
+
+					return boolean_operation(settings, a_face, b_faces, op, face_result, fuzziness);
+				};
+
+				bool slabs_ok = true;
+				NCollection_List<TopoDS_Shape> slabs;
+
+				for (size_t i = 0; i + 1 < cuts.size() && slabs_ok; ++i) {
+					const double slab_start = cuts[i];
+					const double slab_end = cuts[i + 1];
+					const double slab_mid = (slab_start + slab_end) / 2.;
+
+					std::vector<size_t> active;
+					for (size_t k = 0; k < b_extrusions.size(); ++k) {
+						const auto& be = b_extrusions[k];
+						if (be.interval.first < slab_mid && be.interval.second > slab_mid) {
+							active.push_back(k);
+						}
+					}
+
+					TopoDS_Shape face_result;
+					if (!subtract_2d(active, face_result)) {
+						settings.log().notice("GEO", 142, "Failed to perform 2D boolean operation. Retrying in 3D.");
+						slabs_ok = false;
+						break;
+					}
+
+					PERF("boolean operation: 2d to 3d");
+
+					// The profile sits at a_interval.first; move it to the
+					// slab and extrude it over the slab's depth only.
+					gp_Trsf to_slab;
+					to_slab.SetTranslation(gp_Vec(gp::DY()) * (slab_start - a_interval.first));
+
+					BRepPrimAPI_MakePrism mp(face_result.Moved(to_slab), gp_Vec(gp::DY()) * (slab_end - slab_start));
+					if (!mp.IsDone()) {
 						settings.log().notice("GEO", 141, "Failed to extrude 2D boolean result. Retrying in 3D.");
+						slabs_ok = false;
+						break;
+					}
+					slabs.Append(mp.Shape());
+				}
+
+				TopoDS_Shape slab_result;
+				if (slabs_ok) {
+					if (slabs.Extent() == 1) {
+						slab_result = slabs.First();
+					} else {
+						PERF("boolean operation: stack slabs");
+
+						// The slabs meet on coincident planar faces and never
+						// interpenetrate, which is exactly the case gluing a
+						// fuse is meant for -- it skips the face/face
+						// intersection that makes this expensive otherwise.
+						NCollection_List<TopoDS_Shape> stack_args, stack_tools;
+						NCollection_List<TopoDS_Shape>::Iterator sit(slabs);
+						stack_args.Append(sit.Value());
+						for (sit.Next(); sit.More(); sit.Next()) {
+							stack_tools.Append(sit.Value());
+						}
+
+						auto stack_slabs = [&](BOPAlgo_GlueEnum glue, TopoDS_Shape& out) {
+							BRepAlgoAPI_Fuse stack;
+							stack.SetArguments(stack_args);
+							stack.SetTools(stack_tools);
+							stack.SetGlue(glue);
+							stack.SetNonDestructive(true);
+							stack.SetFuzzyValue(fuzz);
+							stack.Build();
+							if (!stack.IsDone()) {
+								return false;
+							}
+							out = stack.Shape();
+							return BRepCheck_Analyzer(out).IsValid() != 0;
+						};
+
+						if (!stack_slabs(BOPAlgo_GlueShift, slab_result)) {
+							settings.log().notice("GEO", 158, "Gluing the 2D slabs failed, stacking them the slow way");
+							if (!stack_slabs(BOPAlgo_GlueOff, slab_result)) {
+								settings.log().notice("GEO", 159, "Failed to stack 2D slabs. Retrying in 3D.");
+								slabs_ok = false;
+							}
+						}
+					}
+				}
+
+				if (slabs_ok) {
+					if (b_remainder_3d.Extent()) {
+						settings.log().notice("GEO", 139, std::to_string(b_remainder_3d.Extent()) + " operands remaining to process in 3D");
+						b = b_remainder_3d;
+						s1s.Clear();
+						s1s.Append(slab_result);
+					} else {
+						settings.log().notice("GEO", 140, "Processed fully in 2D");
+						result = slab_result;
+						return true;
 					}
 				} else {
-					settings.log().notice("GEO", 142, "Failed to perform 2D boolean operation. Retrying in 3D.");
+					b_remainder_3d = b;
 				}
-			} else {
-				settings.log().notice("GEO", 143, "No second operands can be processed as 2D inner bounds. Retrying in 3D.");
 			}
 		}
 	}
@@ -1201,6 +1340,41 @@ bool ifcopenshell::geom::util::boolean_operation(const boolean_settings& setting
 					dump(r);
 
 					settings.log().notice("GEO", 148, str.str());
+				}
+			}
+
+			if (success && op == BOPAlgo_CUT && !is_2d) {
+				PERF("boolean operation: conserved material");
+
+				// A cut cannot invent material and it cannot remove more than
+				// its tools contain, so the result volume has to land between
+				// vol(a) - sum(vol(b)) and vol(a). OCCT does not always say so
+				// when it breaks that: on the 210 King facade wall, cutting a
+				// 3211-unit wall with a one-inch reveal sliver returned a
+				// perfectly valid-looking husk of 4.6 units, and BRepCheck
+				// called it valid. Without this the wall silently loses 99.9%
+				// of itself; the invalid result the retry loop already knows
+				// how to reject is the safe outcome here.
+				const double volume_a = shape_volume(a);
+				double volume_b = 0.;
+				for (NCollection_List<TopoDS_Shape>::Iterator it(b); it.More(); it.Next()) {
+					volume_b += shape_volume(it.Value());
+				}
+				const double volume_r = shape_volume(r);
+
+				// The slack is relative, because these volumes are integrals
+				// over the faces and carry the fuzziness of the operands.
+				const double slack = 1e-6 * (std::max)(volume_a, 1.0);
+
+				if (volume_r < -slack || volume_r > volume_a + slack
+					|| volume_r < volume_a - volume_b - slack) {
+					settings.log().notice(
+						"GEO", 155,
+						"Boolean operation did not conserve material: "s +
+						std::to_string(volume_a) + " - (at most) "s +
+						std::to_string(volume_b) + " gave "s +
+						std::to_string(volume_r));
+					success = false;
 				}
 			}
 
