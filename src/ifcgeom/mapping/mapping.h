@@ -31,7 +31,16 @@ namespace geom {
 
 		Eigen::Matrix4d offset_and_rotation_ = Eigen::Matrix4d::Identity();
 		
+		// Units of each representation context that measures differently from
+		// the file-level ones, so geometry can be mapped in the units of the
+		// context it belongs to. Empty when every context agrees.
+		std::map<uint32_t, std::pair<double, double>> units_by_context_;
+		bool units_vary_ = false;
+
 		void initialize_units_();
+		std::pair<bool, bool> read_units_(const IfcSchema::IfcUnitAssignment&, double& length, double& angle, std::string* length_name);
+		void build_context_units_();
+		void select_units_(const express::base& context);
 		void addRepresentationsFromContextIds(std::vector<IfcSchema::IfcRepresentation>&);
 		void addRepresentationsFromPriorities(std::vector<IfcSchema::IfcRepresentation>&);
 		void addRepresentationsFromDefaultContexts(std::vector<IfcSchema::IfcRepresentation>&);

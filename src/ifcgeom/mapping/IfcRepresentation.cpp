@@ -22,6 +22,10 @@
 using namespace ifcopenshell::geom;
 
 taxonomy::ptr mapping::map_impl(const IfcSchema::IfcRepresentation& inst) {
+	// Everything below is measured in the units of the context this
+	// representation is expressed in, which is not always the file's.
+	select_units_(inst.ContextOfItems());
+
 	auto items_to_include = this->settings_.get<settings::OutputDimensionality>().get();
 
 	auto items = map_to_collection(this, inst.Items());

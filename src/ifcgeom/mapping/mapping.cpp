@@ -927,46 +927,9 @@ void mapping::initialize_units_() {
         return;
     }
 
-    bool length_unit_encountered = false, angle_unit_encountered = false;
-
-    try {
-        auto units = unit_assignment.Units();
-        if (units.empty()) {
-            logger_.warning("GEO", 310, "No unit information found");
-        } else {
-            for (auto& base : units) {
-                if (auto named_unit = base.as<IfcSchema::IfcNamedUnit>()) {
-                    if (named_unit.UnitType() == IfcSchema::IfcUnitEnum::IfcUnit_LENGTHUNIT ||
-                        named_unit.UnitType() == IfcSchema::IfcUnitEnum::IfcUnit_PLANEANGLEUNIT) {
-                        std::string current_unit_name;
-                        const double current_unit_magnitude = ifcopenshell::get_SI_equivalent<IfcSchema>(named_unit);
-                        if (current_unit_magnitude != 0.) {
-                            if (auto u = named_unit.as<IfcSchema::IfcConversionBasedUnit>()) {
-                                current_unit_name = u.Name();
-                            } else if (auto si_unit = named_unit.as<IfcSchema::IfcSIUnit>()) {
-                                if (si_unit.Prefix()) {
-                                    current_unit_name = IfcSchema::IfcSIPrefix::ToString(*si_unit.Prefix());
-                                }
-                                current_unit_name += IfcSchema::IfcSIUnitName::ToString(si_unit.Name());
-                            }
-                            if (named_unit.UnitType() == IfcSchema::IfcUnitEnum::IfcUnit_LENGTHUNIT) {
-                                length_unit_name_ = current_unit_name;
-                                length_unit_ = current_unit_magnitude;
-                                length_unit_encountered = true;
-                            } else {
-                                angle_unit_ = current_unit_magnitude;
-                                angle_unit_encountered = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    } catch (const ifcopenshell::exception& ex) {
-        std::stringstream ss;
-        ss << "Failed to determine unit information '" << ex.what() << "'";
-        logger_.message(ifcopenshell::logger::LOG_ERROR, "GEO", 311, ss.str());
-    }
+    auto encountered = read_units_(unit_assignment, length_unit_, angle_unit_, &length_unit_name_);
+    const bool length_unit_encountered = encountered.first;
+    const bool angle_unit_encountered = encountered.second;
 
     if (!length_unit_encountered) {
         logger_.warning("GEO", 312, "No length unit encountered");
@@ -975,6 +938,11 @@ void mapping::initialize_units_() {
     if (!angle_unit_encountered) {
         logger_.warning("GEO", 313, "No plane angle unit encountered");
     }
+
+    // The file-level units above are the ones anything without a context of
+    // its own is measured in. Where the contexts disagree, each is mapped in
+    // its own.
+    build_context_units_();
 
     // @todo move to a more descriptive function
     if (settings_.get<settings::BuildingLocalPlacement>().get()) {

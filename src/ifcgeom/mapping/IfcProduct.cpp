@@ -5,6 +5,15 @@ using namespace ifcopenshell::geom;
 taxonomy::ptr mapping::map_impl(const IfcSchema::IfcProduct& inst) {
 	// @todo decide on this, what happens in the product mapping?
 	// currently things like openings, layers and materials are processed in the converter
+	// A placement is measured in the units of the context the product's own
+	// geometry is expressed in.
+	if (auto product_representation = inst.Representation()) {
+		auto representations = product_representation.Representations();
+		if (!representations.empty()) {
+			select_units_(representations.front().ContextOfItems());
+		}
+	}
+
 	auto c = taxonomy::make<taxonomy::collection>();
 	if (inst.ObjectPlacement()) {
 		c->matrix = taxonomy::cast<taxonomy::matrix4>(map(inst.ObjectPlacement()));
