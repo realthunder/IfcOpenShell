@@ -884,23 +884,43 @@ void mapping::initialize_units_() {
     } else if (projects.empty()) {
         logger_.warning("GEO", 308, "No project or context in file");
     } else {
-        // A federated file carries one context per model it was assembled
-        // from, and they normally agree. Giving up here left the plane angle
-        // unit undefined, so a file whose trim parameters are in degrees had
-        // every arc read as radians: the profile no longer closed, the wire
-        // builder bridged the ends with straight segments, and the body came
-        // out self-intersecting with faces that will not even triangulate.
-        // Take the units of the first context that declares any, and warn
-        // that the others are ignored. Comparing them all would be better,
-        // but this translation unit is already at the linker's reach for a
-        // PLT32 relocation and the extra instantiation does not fit.
-        for (auto& project : projects) {
-            if (auto assignment = project.UnitsInContext()) {
+        // More than one context, which happens two quite different ways.
+        //
+        // From IFC4 on IfcProjectLibrary is an IfcContext too and carries its
+        // own units, so a file holding a library has two contexts and is
+        // perfectly valid. The units that apply to the project's content are
+        // the project's, so prefer those and fall back to another context
+        // only when no project declares any.
+        //
+        // Several IfcProject instances is not valid -- every schema since
+        // IFC2x3 carries the global rule IfcSingleProjectInstance, SIZEOF
+        // (IfcProject) <= 1 -- but merged and federated exports do it anyway,
+        // and they normally repeat the same units in each.
+        //
+        // Either way, giving up was the worst of the answers: it left the
+        // plane angle unit undefined, so a file whose trim parameters are in
+        // degrees had every arc read as radians. The profile then no longer
+        // closed, the wire builder bridged the ends with straight segments,
+        // and the body came out self-intersecting.
+        bool from_project = false;
+        int projects_seen = 0;
+        for (auto& context : projects) {
+            const bool is_project = !!context.template as<IfcSchema::IfcProject>();
+            projects_seen += is_project ? 1 : 0;
+            auto assignment = context.UnitsInContext();
+            if (!assignment) {
+                continue;
+            }
+            if (!unit_assignment || (is_project && !from_project)) {
                 unit_assignment = assignment;
-                break;
+                from_project = is_project;
             }
         }
-        logger_.warning("GEO", 308, "More than one project or context in file; using the units of the first that declares any and ignoring the rest");
+        if (projects_seen > 1) {
+            logger_.warning("GEO", 308, "More than one IfcProject in file, which the rule IfcSingleProjectInstance forbids; taking the units of the first and ignoring the rest");
+        } else if (unit_assignment && !from_project) {
+            logger_.warning("GEO", 308, "No IfcProject in this file declares units; taking those of another context");
+        }
     }
     if (!unit_assignment) {
         logger_.warning("GEO", 309, "Unable to detect unit information");
