@@ -1162,6 +1162,43 @@ bool ifcopenshell::geom::util::boolean_operation(const boolean_settings& setting
 						}
 					}
 
+					{
+						PERF("boolean operation: 2d area");
+
+						// Lines and arcs survive the lattice; anything else --
+						// a B-spline, an ellipse -- would come back faceted,
+						// so it is left to the kernel rather than
+						// approximated. Splitting them means the hundreds of
+						// operands the lattice can take still go the fast way
+						// and only the handful it cannot are a boolean
+						// problem -- and that cut is superlinear in the number
+						// of operands, so a handful is cheap.
+						NCollection_List<TopoDS_Shape> b_flat, b_other;
+						for (NCollection_List<TopoDS_Shape>::Iterator bit(b_faces); bit.More(); bit.Next()) {
+							if (boolean_2d_area_supports(bit.Value())) {
+								b_flat.Append(bit.Value());
+							} else {
+								b_other.Append(bit.Value());
+							}
+						}
+
+						if (!b_flat.IsEmpty()) {
+							TopoDS_Shape clipped;
+							if (boolean_subtraction_2d_using_area(a_face, b_flat, clipped, fuzziness, settings.log())) {
+								if (b_other.IsEmpty()) {
+									face_result = clipped;
+									return true;
+								}
+
+								settings.log().notice("GEO", 410, std::to_string(b_other.Extent()) + " of " + std::to_string(b_faces.Extent()) + " operands are outside the 2D engine's domain and go to the kernel");
+
+								if (boolean_operation(settings, clipped, b_other, op, face_result, fuzziness)) {
+									return true;
+								}
+							}
+						}
+					}
+
 					PERF("boolean operation: 2d");
 
 					return boolean_operation(settings, a_face, b_faces, op, face_result, fuzziness);
@@ -1192,6 +1229,13 @@ bool ifcopenshell::geom::util::boolean_operation(const boolean_settings& setting
 
 					PERF("boolean operation: 2d to 3d");
 
+					if (!TopExp_Explorer(face_result, TopAbs_FACE).More()) {
+						// The operands covered the whole profile over this
+						// slab, so the slab contributes nothing. That is a
+						// result, not a failure -- extruding it would be.
+						continue;
+					}
+
 					// The profile sits at a_interval.first; move it to the
 					// slab and extrude it over the slab's depth only.
 					gp_Trsf to_slab;
@@ -1207,6 +1251,14 @@ bool ifcopenshell::geom::util::boolean_operation(const boolean_settings& setting
 				}
 
 				TopoDS_Shape slab_result;
+				if (slabs_ok && slabs.IsEmpty()) {
+					// Every slab came back empty, so the operands cover the
+					// whole of A. Let the 3D kernel be the one to say a
+					// product has no geometry left.
+					settings.log().notice("GEO", 405, "2D subtraction left nothing of the first operand. Retrying in 3D.");
+					slabs_ok = false;
+				}
+
 				if (slabs_ok) {
 					if (slabs.Extent() == 1) {
 						slab_result = slabs.First();

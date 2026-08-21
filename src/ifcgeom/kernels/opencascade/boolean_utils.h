@@ -93,6 +93,10 @@ namespace ifcopenshell::geom {
 
 		IFC_GEOMLIBRARY_API bool boolean_subtraction_2d_using_builder(const TopoDS_Shape& a_input, const NCollection_List<TopoDS_Shape>& b_input, TopoDS_Shape& result, double eps, ifcopenshell::logger& logger = ifcopenshell::logger::root());
 
+		IFC_GEOMLIBRARY_API bool boolean_subtraction_2d_using_area(const TopoDS_Shape& a_input, const NCollection_List<TopoDS_Shape>& b_input, TopoDS_Shape& result, double eps, ifcopenshell::logger& logger = ifcopenshell::logger::root());
+
+		IFC_GEOMLIBRARY_API bool boolean_2d_area_supports(const TopoDS_Shape& s);
+
 		struct boolean_settings {
 			bool debug, attempt_2d;
 			double precision;

@@ -1,5 +1,15 @@
 message(STATUS "GEOMETRY_KERNELS ${GEOMETRY_KERNELS}")
 
+# libarea -- Clipper, with arcs surviving the round trip. Used for planar
+# subtraction in the OpenCASCADE kernel. Optional: without it those
+# subtractions go to the boolean kernel, which is where they went before.
+find_package(libarea CONFIG QUIET)
+if(libarea_FOUND)
+    message(STATUS "libarea ${libarea_VERSION} found, 2D subtraction enabled")
+else()
+    message(STATUS "libarea not found, planar subtraction will use the boolean kernel")
+endif()
+
 set(kernel_plugin_runtime_dir "$<TARGET_FILE_DIR:IfcGeom>")
 
 if (NOT WASM_BUILD)
@@ -40,6 +50,10 @@ foreach(kernel ${GEOMETRY_KERNELS})
     )
     list(APPEND kernel_libraries ${KERNEL_TARGET})
     target_link_libraries(${KERNEL_TARGET} PRIVATE ${plugin_when_not_wasm} IfcGeom ${${KERNEL_UPPER}_LIBRARIES} Eigen3::Eigen)
+    if(${kernel} STREQUAL "opencascade" AND libarea_FOUND)
+        target_link_libraries(${KERNEL_TARGET} PRIVATE libarea::area)
+        target_compile_definitions(${KERNEL_TARGET} PRIVATE IFOPSH_WITH_LIBAREA)
+    endif()
 
     install(TARGETS ${KERNEL_TARGET})
 
