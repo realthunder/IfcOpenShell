@@ -39,17 +39,27 @@ ifcopenshell::geom::native_element* ifcopenshell::geom::converter::create_brep_f
 		std::map<express::base, ifcopenshell::geom::layerset_information> neigbour_layers;
 		int layerset_id, lid;
 
-		if (mapping_->get_layerset_information(product, layerinfo, layerset_id)) {
-			representation_id_builder << "-layerset-" << layerset_id;
-			if (mapping_->get_wall_neighbours(product, neighbours)) {
-				for (auto& n : neighbours) {
-					auto p = std::get<2>(n);
-					mapping_->get_layerset_information(p, neigbour_layers[p], lid);
+		// Slicing a product into its material layers is a decoration on top of
+		// a body that has already been built. If any part of it fails, the
+		// product still has that body, so keep it rather than losing the
+		// element: the shapes are only ever replaced on success.
+		try {
+			if (mapping_->get_layerset_information(product, layerinfo, layerset_id)) {
+				representation_id_builder << "-layerset-" << layerset_id;
+				if (mapping_->get_wall_neighbours(product, neighbours)) {
+					for (auto& n : neighbours) {
+						auto p = std::get<2>(n);
+						mapping_->get_layerset_information(p, neigbour_layers[p], lid);
+					}
+					kernel_->apply_folded_layerset(shapes, layerinfo, neigbour_layers);
+				} else {
+					kernel_->apply_layerset(shapes, layerinfo);
 				}
-				kernel_->apply_folded_layerset(shapes, layerinfo, neigbour_layers);
-			} else {
-				kernel_->apply_layerset(shapes, layerinfo);
 			}
+		} catch (const std::exception& e) {
+			logger_.message(ifcopenshell::logger::LOG_ERROR, "GEO", 260, std::string("Failed to apply the material layer set, keeping the unsliced body: ") + e.what() + ":", product);
+		} catch (...) {
+			logger_.message(ifcopenshell::logger::LOG_ERROR, "GEO", 260, "Failed to apply the material layer set, keeping the unsliced body:", product);
 		}
 
 		/*

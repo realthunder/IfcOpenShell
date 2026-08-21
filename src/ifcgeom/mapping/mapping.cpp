@@ -1067,12 +1067,24 @@ bool mapping::get_layerset_information(const express::base& p, layerset_informat
             return false;
         }
 
-        auto curve = map(axis_representation);
-        auto product_node = taxonomy::cast<taxonomy::geom_item>(map(product));
+        // The items, not the representation. Mapping a representation drops
+        // curve items unless the output dimensionality asks for them, and an
+        // Axis representation is nothing but a curve, so map() returns null
+        // here for every wall. The cast below then threw "Unexpected
+        // topology", which reaches the iterator and loses the whole product --
+        // the wall, not just its layers. See IfcOpenShell issue #6607.
+        auto curve = map_to_collection(this, axis_representation.Items());
+        auto product_node = taxonomy::dcast<taxonomy::geom_item>(map(product));
+
+        if (!curve || !product_node) {
+            logger_.message(ifcopenshell::logger::LOG_WARNING, "GEO", 322, "Failed to convert the axis representation of:", product);
+            return false;
+        }
 
         auto& m4 = product_node->matrix;
-        auto c2 = flatten(taxonomy::cast<taxonomy::collection>(curve));
-        if (c2->children.empty()) {
+        auto c2 = flatten(curve);
+        if (!c2 || c2->children.empty()) {
+            logger_.message(ifcopenshell::logger::LOG_WARNING, "GEO", 322, "Failed to convert the axis representation of:", product);
             return false;
         }
 
