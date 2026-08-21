@@ -18,6 +18,8 @@
 #include <TopoDS_Shape.hxx>
 #include <NCollection_List.hxx>
 
+#include <string>
+
 #include <Bnd_Box.hxx>
 
 #include <BRepBuilderAPI_MakeShell.hxx>
@@ -132,6 +134,17 @@ namespace {
 					}
 				}
 
+				// A piece could not be placed. Pieces are placed by which
+				// cutting surface their faces sit on, compared by surface
+				// object, and the splitter only hands back the object it was
+				// given where it had no reason to rebuild the face -- which it
+				// does have when the surface is periodic. So a curved layer
+				// boundary loses every piece here and the body stays whole.
+				// Ordering the pieces by where they sit instead looks like the
+				// fix and was tried: it admits pieces that are not layers, on
+				// bodies whose own thickness does not match the layer set they
+				// carry, so it needs a check that the pieces are the declared
+				// thicknesses before it can be trusted.
 				ifcopenshell::logger::root().error("GEO", 171, "Unable to map layer geometry to material index");
 				return false;
 			}
@@ -297,7 +310,11 @@ bool ifcopenshell::geom::util::apply_layerset(const std::vector<conversion_resul
 				result.push_back(conversion_result(it->ItemId(), it->placement(),new open_cascade_shape(b), (!!styles[0] ? styles[0] : it->style_ptr())));
 				result.push_back(conversion_result(it->ItemId(), it->placement(),new open_cascade_shape(a), (!!styles[1] ? styles[1] : it->style_ptr())));
 			} else {
-				continue;
+				// Skipping the item would report success while handing back a
+				// result this body is missing from, and the caller has no way
+				// to tell that from a body that was genuinely divided.
+				ifcopenshell::logger::root().warning("GEO", 326, "Unable to divide a body by its single layer boundary");
+				return false;
 			}
 		}
 
@@ -343,6 +360,7 @@ bool ifcopenshell::geom::util::apply_layerset(const std::vector<conversion_resul
 			for (unsigned i = 1; i < surfaces.size() - 1; ++i) {
 				double u1, v1, u2, v2;
 				if (!project(surfaces[i], sld, u1, v1, u2, v2)) {
+					ifcopenshell::logger::root().warning("GEO", 324, "Unable to fit layer boundary " + std::to_string(i) + " of " + std::to_string(surfaces.size()) + " to the body it divides");
 					return false;
 				}
 
@@ -364,6 +382,7 @@ bool ifcopenshell::geom::util::apply_layerset(const std::vector<conversion_resul
 					result.push_back(conversion_result(it->ItemId(), it->placement(), new open_cascade_shape(slices[i]), (!!styles[i] ? styles[i] : it->style_ptr())));
 				}
 			} else {
+				ifcopenshell::logger::root().warning("GEO", 325, "Splitting a body by " + std::to_string(operands.Extent()) + " layer boundaries did not give one piece per layer");
 				return false;
 			}
 		}

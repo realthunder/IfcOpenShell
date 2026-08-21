@@ -1125,7 +1125,12 @@ bool mapping::get_layerset_information(const express::base& p, layerset_informat
                 auto ofc = taxonomy::make<taxonomy::offset_curve>();
                 ofc->offset = -offset;
                 ofc->reference = Z;
-                ofc->basis = c2;
+                // The axis curve, as the first boundary above and the
+                // zero-offset one beside it both use. This said c2, the
+                // collection wrapping it, which is not a curve any kernel can
+                // dispatch on, so every boundary after the first was
+                // unbuildable.
+                ofc->basis = c;
                 ofc->matrix = m4;
                 info.layers.push_back(ofc);
             }

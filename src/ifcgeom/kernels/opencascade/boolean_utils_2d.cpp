@@ -57,6 +57,8 @@ bool ifcopenshell::geom::util::boolean_2d_area_supports(const TopoDS_Shape&) {
 
 #else
 
+#include "area_2d.h"
+
 #include <libarea/Area.h>
 
 #include <BRepAdaptor_Curve.hxx>
@@ -91,39 +93,9 @@ bool ifcopenshell::geom::util::boolean_2d_area_supports(const TopoDS_Shape&) {
 #include <string>
 #include <vector>
 
+using namespace ifcopenshell::geom::util::area2d;
+
 namespace {
-	// libarea's Clipper bridge keeps the points of the polygon it is currently
-	// building in a file-static list, and its tolerances are static members of
-	// CArea. Neither is per-call state, so the whole of the 2D path is taken
-	// one at a time. It costs nothing worth measuring: the operations being
-	// serialised are the microsecond ones, and the reason this path exists is
-	// that the alternative takes seconds.
-	std::mutex& area_lock() {
-		static std::mutex m;
-		return m;
-	}
-
-	// CArea's tolerances are static, so they are set once rather than per
-	// call: a second thread in here would otherwise be writing them while the
-	// first reads them. They are the same values every time in any case --
-	// eps is the model's precision, which does not vary within a run.
-	//
-	// m_accuracy is the sagitta an arc is allowed when it is walked onto the
-	// lattice, and also how far from a circle a run of segments may be and
-	// still be recognised as an arc coming back. The two have to agree or
-	// nothing that goes in as an arc comes back as one, which is why it is one
-	// number and not two.
-	void configure_area(double eps) {
-		static std::once_flag once;
-		std::call_once(once, [eps]() {
-			CArea::m_units = 1.0;
-			CArea::m_fit_arcs = true;
-			CArea::m_accuracy = eps > 0. ? eps : 1e-5;
-			CArea::m_clipper_clean_distance = 0.;
-			CArea::m_clipper_simple = false;
-		});
-	}
-
 	// A right-handed frame on the face's plane. gp_Ax3 is allowed to be
 	// left-handed, and the direction an arc turns is read off the sign of its
 	// axis against this frame's normal, so taking the plane's own X and Y
@@ -131,74 +103,6 @@ namespace {
 	gp_Ax3 frame_of(const Handle(Geom_Plane)& plane) {
 		const gp_Ax3& p = plane->Position();
 		return gp_Ax3(p.Location(), p.Direction(), p.XDirection());
-	}
-
-	Point to_2d(const gp_Pnt& p, const gp_Ax3& f) {
-		const gp_Vec d(f.Location(), p);
-		return Point(d.Dot(gp_Vec(f.XDirection())), d.Dot(gp_Vec(f.YDirection())));
-	}
-
-	gp_Pnt to_3d(const Point& p, const gp_Ax3& f) {
-		return f.Location().Translated(gp_Vec(f.XDirection()) * p.x + gp_Vec(f.YDirection()) * p.y);
-	}
-
-	// A line or an arc goes onto the lattice without losing its identity.
-	// Anything else -- a B-spline, an ellipse -- would have to be walked into
-	// segments and would come back as segments, which is the outcome this
-	// whole path exists to avoid, so it is left to the kernel instead.
-	bool edge_is_representable(const TopoDS_Edge& e) {
-		const GeomAbs_CurveType t = BRepAdaptor_Curve(e).GetType();
-		return t == GeomAbs_Line || t == GeomAbs_Circle;
-	}
-
-	bool wire_to_curve(const TopoDS_Wire& w, const gp_Ax3& f, CCurve& curve) {
-		BRepTools_WireExplorer xp(w);
-		if (!xp.More()) {
-			return false;
-		}
-
-		curve.append(CVertex(to_2d(BRep_Tool::Pnt(xp.CurrentVertex()), f)));
-
-		for (; xp.More(); xp.Next()) {
-			const TopoDS_Edge& edge = xp.Current();
-			BRepAdaptor_Curve c(edge);
-			const bool reversed = edge.Orientation() == TopAbs_REVERSED;
-			const double first = c.FirstParameter();
-			const double last = c.LastParameter();
-			const gp_Pnt end = c.Value(reversed ? first : last);
-
-			switch (c.GetType()) {
-			case GeomAbs_Line:
-				curve.append(CVertex(to_2d(end, f)));
-				break;
-			case GeomAbs_Circle: {
-				const gp_Circ circle = c.Circle();
-				// Which way the arc turns in this frame, not in the frame the
-				// circle was defined in.
-				int type = circle.Axis().Direction().Dot(f.Direction()) < 0. ? -1 : 1;
-				if (reversed) {
-					type = -type;
-				}
-				const Point centre = to_2d(circle.Location(), f);
-				// A CVertex arc is defined by its two end points and its
-				// centre, which does not distinguish an arc from its
-				// complement once it is more than half a circle. Split it.
-				if (std::fabs(last - first) > M_PI) {
-					curve.append(CVertex(type, to_2d(c.Value(first + (last - first) * 0.5), f), centre));
-				}
-				curve.append(CVertex(type, to_2d(end, f), centre));
-				break;
-			}
-			default:
-				return false;
-			}
-		}
-
-		if (!curve.IsClosed()) {
-			curve.append(curve.m_vertices.front());
-		}
-
-		return curve.m_vertices.size() >= 3;
 	}
 
 	// Under the non-zero rule it is the winding that says which side of a
@@ -225,7 +129,7 @@ namespace {
 				continue;
 			}
 			CCurve curve;
-			if (!wire_to_curve(TopoDS::Wire(it.Value()), f, curve)) {
+			if (!wire_to_curve(TopoDS::Wire(it.Value()), f, true, curve)) {
 				// Dropping a boundary here would quietly hand back a shape
 				// with a hole missing, which is worse than not answering.
 				return false;
@@ -235,48 +139,6 @@ namespace {
 			any = true;
 		}
 		return any;
-	}
-
-	bool is_left(const Point& a, const Point& b, const Point& p) {
-		return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x) > 0.;
-	}
-
-	// FitArcs picks a centre that fits a run of lattice points, so the two end
-	// points of the arc it produces are not exactly the same distance from it.
-	// Move the centre onto the perpendicular bisector of the chord, on the
-	// side it was already on, at the averaged radius.
-	void reconcile_arc(const Point& p0, const Point& p1, Point& centre, double& r) {
-		const double r0 = p0.dist(centre);
-		const double r1 = p1.dist(centre);
-		r = (r0 + r1) * 0.5;
-
-		if (std::fabs(r0 - r1) <= Precision::Confusion()) {
-			return;
-		}
-
-		const double d = p0.dist(p1);
-		if (d <= Precision::Confusion()) {
-			return;
-		}
-
-		double rr = r * r;
-		const double dd = d * d * 0.25;
-		if (rr < dd) {
-			r = d * 0.5;
-			rr = dd;
-		}
-
-		const double q = std::sqrt(rr - dd);
-		const double x = (p0.x + p1.x) * 0.5;
-		const double y = (p0.y + p1.y) * 0.5;
-		const double dx = q * (p0.y - p1.y) / d;
-		const double dy = q * (p1.x - p0.x) / d;
-
-		Point moved(x + dx, y + dy);
-		if (is_left(p0, p1, centre) != is_left(p0, p1, moved)) {
-			moved = Point(x - dx, y - dy);
-		}
-		centre = moved;
 	}
 
 	// Null on failure. A wire that cannot be rebuilt is not patched up with
@@ -497,8 +359,8 @@ bool ifcopenshell::geom::util::boolean_subtraction_2d_using_area(const TopoDS_Sh
 
 	const gp_Ax3 f = frame_of(plane);
 
-	configure_area(eps);
-	std::lock_guard<std::mutex> guard(area_lock());
+	configure(eps);
+	std::lock_guard<std::mutex> guard(lock());
 
 	PERF("2d area: total");
 
@@ -534,7 +396,7 @@ bool ifcopenshell::geom::util::boolean_subtraction_2d_using_area(const TopoDS_Sh
 	{
 		PERF("2d area: convert subject");
 		CCurve outer;
-		if (!wire_to_curve(a_outer, f, outer)) {
+		if (!wire_to_curve(a_outer, f, true, outer)) {
 			logger.notice("GEO", 406, "Operand A's outer boundary is outside of the 2D engine's domain. Retrying with the kernel.");
 			return false;
 		}
@@ -562,7 +424,7 @@ bool ifcopenshell::geom::util::boolean_subtraction_2d_using_area(const TopoDS_Sh
 		const TopoDS_Wire& w = TopoDS::Wire(it.Value());
 
 		CCurve inner;
-		if (wire_to_curve(w, f, inner)) {
+		if (wire_to_curve(w, f, true, inner)) {
 			wind(inner, true);
 			subject.append(inner);
 			continue;
