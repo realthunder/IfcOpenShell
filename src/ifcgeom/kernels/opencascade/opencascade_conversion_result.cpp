@@ -551,6 +551,7 @@ namespace {
 	conversion_result_shape* boolean_op(BOPAlgo_Operation op, const TopoDS_Shape& shape_, const TopoDS_Shape& other_shape) {
 		ifcopenshell::geom::util::boolean_settings st;
 		st.attempt_2d = true;
+		st.attempt_2d_area = true;
 		st.debug = false;
 		st.precision = 1.e-5;
 

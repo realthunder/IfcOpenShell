@@ -1162,7 +1162,7 @@ bool ifcopenshell::geom::util::boolean_operation(const boolean_settings& setting
 						}
 					}
 
-					{
+					if (settings.attempt_2d_area) {
 						PERF("boolean operation: 2d area");
 
 						// Lines and arcs survive the lattice; anything else --

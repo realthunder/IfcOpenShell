@@ -99,6 +99,10 @@ namespace ifcopenshell::geom {
 
 		struct boolean_settings {
 			bool debug, attempt_2d;
+			// Whether the 2D area engine may take a subtraction. Defaulted rather
+			// than left to the caller: a caller that does not know about it gets
+			// the behaviour it had before the engine existed as an option.
+			bool attempt_2d_area = true;
 			double precision;
 			// Set by callers that carry a per-conversion logger (e.g. kernels deriving
 			// from abstract_kernel). Falls back to the global ifcopenshell::logger::root() singleton.

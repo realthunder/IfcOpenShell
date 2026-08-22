@@ -181,6 +181,12 @@ namespace ifcopenshell {
 				static constexpr bool defaultvalue = true;
 			};
 
+			struct BooleanAttempt2dArea : public SettingBase<BooleanAttempt2dArea, bool> {
+				static constexpr const char* const name = "boolean-attempt-2d-area";
+				static constexpr const char* const description = "Do not use the 2D area engine (libarea/Clipper) for boolean subtractions, leaving them to the kernel. Only has an effect in a build that found libarea; without it the 2D area path is absent either way.";
+				static constexpr bool defaultvalue = true;
+			};
+
 			// These are the old IteratorSettings
 
 			struct WeldVertices : public SettingBase<WeldVertices, bool> {
@@ -918,6 +924,7 @@ using geometry_setting_types = std::tuple<
 			settings_detail::PrecisionFactor,
 			settings_detail::DebugBooleanOperations,
 			settings_detail::BooleanAttempt2d,
+			settings_detail::BooleanAttempt2dArea,
 			settings_detail::SurfaceColour,
 			settings_detail::WeldVertices,
 			settings_detail::UseWorldCoords,
@@ -1022,6 +1029,7 @@ using geometry_setting_types = std::tuple<
 			using PrecisionFactor = settings_detail::PrecisionFactor;
 			using DebugBooleanOperations = settings_detail::DebugBooleanOperations;
 			using BooleanAttempt2d = settings_detail::BooleanAttempt2d;
+			using BooleanAttempt2dArea = settings_detail::BooleanAttempt2dArea;
 			using SurfaceColour = settings_detail::SurfaceColour;
 			using WeldVertices = settings_detail::WeldVertices;
 			using UseWorldCoords = settings_detail::UseWorldCoords;
