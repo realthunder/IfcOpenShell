@@ -93,7 +93,7 @@ namespace ifcopenshell::geom {
 
 		IFC_GEOMLIBRARY_API bool boolean_subtraction_2d_using_builder(const TopoDS_Shape& a_input, const NCollection_List<TopoDS_Shape>& b_input, TopoDS_Shape& result, double eps, ifcopenshell::logger& logger = ifcopenshell::logger::root());
 
-		IFC_GEOMLIBRARY_API bool boolean_subtraction_2d_using_area(const TopoDS_Shape& a_input, const NCollection_List<TopoDS_Shape>& b_input, TopoDS_Shape& result, double eps, ifcopenshell::logger& logger = ifcopenshell::logger::root());
+		IFC_GEOMLIBRARY_API bool boolean_subtraction_2d_using_area(const TopoDS_Shape& a_input, const NCollection_List<TopoDS_Shape>& b_input, TopoDS_Shape& result, double eps, bool fit_circles = true, ifcopenshell::logger& logger = ifcopenshell::logger::root());
 
 		IFC_GEOMLIBRARY_API bool boolean_2d_area_supports(const TopoDS_Shape& s);
 
@@ -103,6 +103,7 @@ namespace ifcopenshell::geom {
 			// than left to the caller: a caller that does not know about it gets
 			// the behaviour it had before the engine existed as an option.
 			bool attempt_2d_area = true;
+			bool area_2d_fit_circles = true;
 			double precision;
 			// Set by callers that carry a per-conversion logger (e.g. kernels deriving
 			// from abstract_kernel). Falls back to the global ifcopenshell::logger::root() singleton.

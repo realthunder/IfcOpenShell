@@ -118,6 +118,7 @@ bool open_cascade_kernel::convert_impl(const taxonomy::boolean_result::ptr br, s
 	util::boolean_settings bst;
 	bst.attempt_2d = settings_.get<settings::BooleanAttempt2d>().get();
 	bst.attempt_2d_area = settings_.get<settings::BooleanAttempt2dArea>().get();
+	bst.area_2d_fit_circles = settings_.get<settings::BooleanArea2dFitCircles>().get();
 	bst.debug = settings_.get<settings::DebugBooleanOperations>().get();
 	bst.precision = settings_.get<settings::Precision>().get();
 	bst.logger = &logger_;

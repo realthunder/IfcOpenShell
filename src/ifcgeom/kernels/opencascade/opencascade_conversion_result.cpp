@@ -552,6 +552,7 @@ namespace {
 		ifcopenshell::geom::util::boolean_settings st;
 		st.attempt_2d = true;
 		st.attempt_2d_area = true;
+		st.area_2d_fit_circles = true;
 		st.debug = false;
 		st.precision = 1.e-5;
 

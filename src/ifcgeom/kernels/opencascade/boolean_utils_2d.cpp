@@ -47,7 +47,7 @@
 
 // Built without libarea, so every caller falls through to the boolean kernel
 // exactly as it did before this path existed.
-bool ifcopenshell::geom::util::boolean_subtraction_2d_using_area(const TopoDS_Shape&, const NCollection_List<TopoDS_Shape>&, TopoDS_Shape&, double, ifcopenshell::logger&) {
+bool ifcopenshell::geom::util::boolean_subtraction_2d_using_area(const TopoDS_Shape&, const NCollection_List<TopoDS_Shape>&, TopoDS_Shape&, double, bool, ifcopenshell::logger&) {
 	return false;
 }
 
@@ -161,6 +161,34 @@ namespace {
 
 			const gp_Pnt next3d = to_3d(v.m_p, f);
 			if (next3d.SquareDistance(prev3d) <= Precision::SquareConfusion()) {
+				// An arc that ends where it began is the whole circle -- what
+				// libarea says when it has put one back together -- and a line
+				// that ends where it began is nothing.
+				if (v.m_type == 0) {
+					continue;
+				}
+
+				const gp_Pnt centre3d = to_3d(v.m_c, f);
+				const double r = centre3d.Distance(prev3d);
+				if (r <= Precision::Confusion()) {
+					continue;
+				}
+
+				gp_Dir axis = f.Direction();
+				if (v.m_type < 0) {
+					axis.Reverse();
+				}
+
+				try {
+					mw.Add(BRepBuilderAPI_MakeEdge(gp_Circ(gp_Ax2(centre3d, axis), r)).Edge());
+				} catch (const Standard_Failure&) {
+					return TopoDS_Wire();
+				}
+
+				if (!mw.IsDone()) {
+					return TopoDS_Wire();
+				}
+
 				continue;
 			}
 
@@ -341,7 +369,7 @@ bool ifcopenshell::geom::util::boolean_2d_area_supports(const TopoDS_Shape& s) {
 	return true;
 }
 
-bool ifcopenshell::geom::util::boolean_subtraction_2d_using_area(const TopoDS_Shape& a_input, const NCollection_List<TopoDS_Shape>& b_input, TopoDS_Shape& result, double eps, ifcopenshell::logger& logger) {
+bool ifcopenshell::geom::util::boolean_subtraction_2d_using_area(const TopoDS_Shape& a_input, const NCollection_List<TopoDS_Shape>& b_input, TopoDS_Shape& result, double eps, bool fit_circles, ifcopenshell::logger& logger) {
 	if (a_input.ShapeType() != TopAbs_FACE) {
 		return false;
 	}
@@ -361,6 +389,10 @@ bool ifcopenshell::geom::util::boolean_subtraction_2d_using_area(const TopoDS_Sh
 
 	configure(eps);
 	std::lock_guard<std::mutex> guard(lock());
+	// Whether the arcs the fit finds are joined back into whole circles is a
+	// caller's choice rather than a tolerance, so it is set here, under the
+	// lock, and not in the once-only configure.
+	CArea::m_fit_circles = fit_circles;
 
 	PERF("2d area: total");
 

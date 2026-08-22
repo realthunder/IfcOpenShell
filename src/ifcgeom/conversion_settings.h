@@ -187,6 +187,12 @@ namespace ifcopenshell {
 				static constexpr bool defaultvalue = true;
 			};
 
+			struct BooleanArea2dFitCircles : public SettingBase<BooleanArea2dFitCircles, bool> {
+				static constexpr const char* const name = "boolean-2d-fit-circles";
+				static constexpr const char* const description = "Do not ask the 2D area engine to join the arcs it fits back into whole circles. The lattice the engine cuts on has no arcs, so they are recognised again afterwards, and the fit stops at half a turn: off, a circle comes back as two edges and an arc of more than 180 degrees as two as well. Only has an effect where the 2D area engine runs.";
+				static constexpr bool defaultvalue = true;
+			};
+
 			// These are the old IteratorSettings
 
 			struct WeldVertices : public SettingBase<WeldVertices, bool> {
@@ -925,6 +931,7 @@ using geometry_setting_types = std::tuple<
 			settings_detail::DebugBooleanOperations,
 			settings_detail::BooleanAttempt2d,
 			settings_detail::BooleanAttempt2dArea,
+			settings_detail::BooleanArea2dFitCircles,
 			settings_detail::SurfaceColour,
 			settings_detail::WeldVertices,
 			settings_detail::UseWorldCoords,
@@ -1030,6 +1037,7 @@ using geometry_setting_types = std::tuple<
 			using DebugBooleanOperations = settings_detail::DebugBooleanOperations;
 			using BooleanAttempt2d = settings_detail::BooleanAttempt2d;
 			using BooleanAttempt2dArea = settings_detail::BooleanAttempt2dArea;
+			using BooleanArea2dFitCircles = settings_detail::BooleanArea2dFitCircles;
 			using SurfaceColour = settings_detail::SurfaceColour;
 			using WeldVertices = settings_detail::WeldVertices;
 			using UseWorldCoords = settings_detail::UseWorldCoords;

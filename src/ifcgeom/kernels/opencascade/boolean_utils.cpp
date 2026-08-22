@@ -1184,7 +1184,7 @@ bool ifcopenshell::geom::util::boolean_operation(const boolean_settings& setting
 
 						if (!b_flat.IsEmpty()) {
 							TopoDS_Shape clipped;
-							if (boolean_subtraction_2d_using_area(a_face, b_flat, clipped, fuzziness, settings.log())) {
+							if (boolean_subtraction_2d_using_area(a_face, b_flat, clipped, fuzziness, settings.area_2d_fit_circles, settings.log())) {
 								if (b_other.IsEmpty()) {
 									face_result = clipped;
 									return true;
