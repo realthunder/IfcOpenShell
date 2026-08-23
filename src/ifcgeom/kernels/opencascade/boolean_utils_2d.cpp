@@ -60,6 +60,7 @@ bool ifcopenshell::geom::util::boolean_2d_area_supports(const TopoDS_Shape&) {
 #include "area_2d.h"
 
 #include <libarea/Area.h>
+#include <clipper2/clipper.h>
 
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
@@ -228,21 +229,21 @@ namespace {
 	// holes as material, and since a cut is in the business of making holes
 	// the total would grow with every one of them -- which reads as a cut that
 	// added area, and rejects a correct result.
-	double lattice_area(const ClipperLib::Paths& paths) {
+	double lattice_area(const Clipper2Lib::Paths64& paths) {
 		double a = 0.;
 		for (const auto& p : paths) {
-			a += ClipperLib::Area(p);
+			a += Clipper2Lib::Area(p);
 		}
 		return std::fabs(a);
 	}
 
-	TopoDS_Wire path_to_wire(const ClipperLib::Path& contour, const gp_Ax3& f, bool hole) {
+	TopoDS_Wire path_to_wire(const Clipper2Lib::Path64& contour, const gp_Ax3& f, bool hole) {
 		// Back through libarea rather than straight off the lattice: this is
-		// where CleanPolygon and FitArcs run, and a hole that came in as an
+		// where SimplifyPath and FitArcs run, and a hole that came in as an
 		// arc leaves as an arc rather than as the several hundred chords it
 		// was walked along.
 		CCurve curve;
-		CurveFromClipperPath(curve, const_cast<ClipperLib::Path&>(contour));
+		CurveFromClipperPath(curve, const_cast<Clipper2Lib::Path64&>(contour));
 
 		// Clipper winds its output the way its own rules require, and the
 		// conversion reverses on the way in and again on the way out, so what
@@ -260,8 +261,8 @@ namespace {
 	// islands standing inside those holes, which is a nesting that the flat
 	// list of contours cannot express and that would otherwise have to be
 	// worked out again from the geometry.
-	bool faces_from_node(const ClipperLib::PolyNode& node, const gp_Ax3& f, double eps, NCollection_List<TopoDS_Shape>& faces, const std::vector<TopoDS_Wire>& carry_through) {
-		const TopoDS_Wire outer = path_to_wire(node.Contour, f, false);
+	bool faces_from_node(const Clipper2Lib::PolyPath64& node, const gp_Ax3& f, double eps, NCollection_List<TopoDS_Shape>& faces, const std::vector<TopoDS_Wire>& carry_through) {
+		const TopoDS_Wire outer = path_to_wire(node.Polygon(), f, false);
 		if (outer.IsNull()) {
 			return false;
 		}
@@ -272,14 +273,14 @@ namespace {
 		// prism raised on that has negative volume.
 		BRepBuilderAPI_MakeFace mf(gp_Pln(f), outer);
 
-		for (const auto* hole : node.Childs) {
+		for (const auto& hole : node) {
 			// Not reversed. Clipper already hands back a hole wound against
 			// its outer contour, which is how a face wants an inner boundary.
 			// The other 2D path in this file does reverse, because there the
 			// wires come off an OCCT face, where an inner wire is already
 			// oriented as a hole of that face -- the same wire from the two
 			// sources arrives with opposite conventions.
-			const TopoDS_Wire hw = path_to_wire(hole->Contour, f, true);
+			const TopoDS_Wire hw = path_to_wire(hole->Polygon(), f, true);
 			if (hw.IsNull()) {
 				return false;
 			}
@@ -313,8 +314,8 @@ namespace {
 		faces.Append(mf.Face());
 
 		// An island inside a hole is solid again, and a face of its own.
-		for (const auto* hole : node.Childs) {
-			for (const auto* island : hole->Childs) {
+		for (const auto& hole : node) {
+			for (const auto& island : *hole) {
 				if (!faces_from_node(*island, f, eps, faces, carry_through)) {
 					return false;
 				}
@@ -477,23 +478,25 @@ bool ifcopenshell::geom::util::boolean_subtraction_2d_using_area(const TopoDS_Sh
 	// at 383 before libarea learned to reject a pair whose bounding boxes are
 	// apart. Clipper knows the nesting while it is building the result and
 	// hands it over for nothing.
-	ClipperLib::Paths subject_paths, clip_paths;
+	Clipper2Lib::Paths64 subject_paths, clip_paths;
 	for (const CCurve& c : subject.m_curves) {
-		subject_paths.push_back(ClipperLib::Path());
+		subject_paths.push_back(Clipper2Lib::Path64());
 		CurveToClipperPath(c, subject_paths.back());
 	}
 	for (const CCurve& c : tools.m_curves) {
-		clip_paths.push_back(ClipperLib::Path());
+		clip_paths.push_back(Clipper2Lib::Path64());
 		CurveToClipperPath(c, clip_paths.back());
 	}
 
-	ClipperLib::PolyTree solution;
+	Clipper2Lib::PolyTree64 solution;
 	{
 		PERF("2d area: subtract");
-		ClipperLib::Clipper clipper;
-		if (!clipper.AddPaths(subject_paths, ClipperLib::ptSubject, true) ||
-			!clipper.AddPaths(clip_paths, ClipperLib::ptClip, true) ||
-			!clipper.Execute(ClipperLib::ctDifference, solution, ClipperLib::pftNonZero, ClipperLib::pftNonZero)) {
+		// AddSubject and AddClip do not report, unlike Clipper1's AddPaths;
+		// Execute is the only thing left that can say no.
+		Clipper2Lib::Clipper64 clipper;
+		clipper.AddSubject(subject_paths);
+		clipper.AddClip(clip_paths);
+		if (!clipper.Execute(Clipper2Lib::ClipType::Difference, Clipper2Lib::FillRule::NonZero, solution)) {
 			return false;
 		}
 	}
@@ -505,8 +508,7 @@ bool ifcopenshell::geom::util::boolean_subtraction_2d_using_area(const TopoDS_Sh
 	// and the total is what shows it. In lattice units on both sides, which is
 	// the only place the two are comparable.
 	{
-		ClipperLib::Paths flat;
-		ClipperLib::ClosedPathsFromPolyTree(solution, flat);
+		const Clipper2Lib::Paths64 flat = Clipper2Lib::PolyTreeToPaths64(solution);
 		if (lattice_area(flat) > lattice_area(subject_paths) * (1. + 1e-9) + 1.) {
 			logger.notice("GEO", 405, "2D subtraction returned more area than it started with. Retrying with the kernel.");
 			return false;
@@ -516,7 +518,7 @@ bool ifcopenshell::geom::util::boolean_subtraction_2d_using_area(const TopoDS_Sh
 	PERF("2d area: rebuild");
 
 	NCollection_List<TopoDS_Shape> faces;
-	for (const auto* node : solution.Childs) {
+	for (const auto& node : solution) {
 		if (!faces_from_node(*node, f, eps, faces, carry_through)) {
 			logger.notice("GEO", 405, "The 2D result could not be made into a face. Retrying with the kernel.");
 			return false;
