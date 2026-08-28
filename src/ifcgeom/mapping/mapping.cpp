@@ -1245,10 +1245,6 @@ bool mapping::get_layerset_information(const express::base& p, layerset_informat
     return true;
 }
 
-bool mapping::get_wall_neighbours(const express::base&, std::vector<endpoint_connection>&) {
-    return false;
-}
-
 IfcSchema::IfcRepresentation mapping::find_representation(const IfcSchema::IfcProduct& product, const std::string& identifier) {
     if (auto prod_rep = product.Representation()) {
         std::vector<IfcSchema::IfcRepresentation> reps = prod_rep.Representations();

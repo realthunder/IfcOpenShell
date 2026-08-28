@@ -50,6 +50,7 @@
 #include <BRepGProp.hxx>
 #include <BRep_Tool.hxx>
 #include <GeomAPI_ProjectPointOnSurf.hxx>
+#include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Vertex.hxx>
@@ -71,6 +72,7 @@
 
 #include <cmath>
 #include <iterator>
+#include <map>
 #include <list>
 #include <mutex>
 
@@ -272,6 +274,330 @@ namespace {
 		return n > 0;
 	}
 
+	// The curve a layer boundary is an offset of. Every boundary of a wall is
+	// an offset of the one axis, which is what lets a single coordinate place
+	// anything across the stack.
+	taxonomy::ptr boundary_basis(const taxonomy::ptr& layer) {
+		if (auto oc = taxonomy::dcast<taxonomy::offset_curve>(layer)) {
+			return oc->basis;
+		}
+		return layer;
+	}
+
+	// The product placement the mapping left on every boundary it built. It is
+	// deliberately not read when a body is sliced on its own -- body and
+	// boundaries are in the same coordinates there -- but a neighbour's
+	// boundaries arrive in the neighbour's coordinates and have to be carried
+	// into ours.
+	bool placement_of(const taxonomy::ptr& layer, Eigen::Matrix4d& m) {
+		auto g = taxonomy::dcast<taxonomy::geom_item>(layer);
+		if (!g) {
+			return false;
+		}
+		m = g->matrix ? g->matrix->ccomponents() : Eigen::Matrix4d::Identity();
+		return true;
+	}
+
+	// Both are placements, so the step between them is a rigid motion. A
+	// matrix that is not one is refused rather than approximated: a scaled or
+	// sheared fold surface would cut the body in the wrong place, and cutting
+	// in the wrong place is worse than not folding.
+	bool relative_placement(const layerset_information& ours, const layerset_information& theirs, gp_Trsf& trsf) {
+		Eigen::Matrix4d a, b;
+		if (ours.layers.empty() || theirs.layers.empty()) {
+			return false;
+		}
+		if (!placement_of(ours.layers.front(), a) || !placement_of(theirs.layers.front(), b)) {
+			return false;
+		}
+
+		const Eigen::Matrix4d rel = a.inverse() * b;
+		const Eigen::Matrix3d r = rel.block<3, 3>(0, 0);
+		if ((r.transpose() * r - Eigen::Matrix3d::Identity()).norm() > 1.e-6) {
+			return false;
+		}
+
+		trsf.SetValues(
+			rel(0, 0), rel(0, 1), rel(0, 2), rel(0, 3),
+			rel(1, 0), rel(1, 1), rel(1, 2), rel(1, 3),
+			rel(2, 0), rel(2, 1), rel(2, 2), rel(2, 3));
+		return true;
+	}
+
+	// The ends of the wall axis, in the wall's own coordinates.
+	bool axis_end_points(open_cascade_kernel* kernel, const layerset_information& info, gp_Pnt& a, gp_Pnt& b) {
+		if (info.layers.empty()) {
+			return false;
+		}
+		const taxonomy::ptr basis = boundary_basis(info.layers.front());
+		if (!basis) {
+			return false;
+		}
+		const TopoDS_Wire w = wire_of(kernel, basis);
+		if (w.IsNull()) {
+			return false;
+		}
+		TopoDS_Vertex v1, v2;
+		TopExp::Vertices(w, v1, v2);
+		if (v1.IsNull() || v2.IsNull()) {
+			return false;
+		}
+		a = BRep_Tool::Pnt(v1);
+		b = BRep_Tool::Pnt(v2);
+		return a.Distance(b) > Precision::Confusion();
+	}
+
+	// The point of a surface nearest a given point.
+	bool foot_on(const Handle(Geom_Surface)& s, const gp_Pnt& from, gp_Pnt& foot) {
+		GeomAPI_ProjectPointOnSurf proj(from, s);
+		if (!proj.IsDone() || proj.NbPoints() == 0) {
+			return false;
+		}
+		foot = proj.NearestPoint();
+		return true;
+	}
+
+	// Where a boundary sits when measured from a point along a direction. This
+	// asks the surface for its nearest point rather than for a normal, so a
+	// plane and a cylinder answer the same way.
+	bool score_along(const Handle(Geom_Surface)& s, const gp_Pnt& from, const gp_Vec& dir, double& score) {
+		GeomAPI_ProjectPointOnSurf proj(from, s);
+		if (!proj.IsDone() || proj.NbPoints() == 0) {
+			return false;
+		}
+		score = gp_Vec(from, proj.NearestPoint()).Dot(dir);
+		return true;
+	}
+
+	// A surface with its normal made to point a chosen way.
+	//
+	// This matters because apply_folded_layerset decides which part of each
+	// surface to keep from the surface's own normal: it keeps the boundary on
+	// the far side of the fold and the fold on the far side of the boundary,
+	// and those two half-space choices are what make the pair turn a corner
+	// one way rather than another. The normal a boundary happens to arrive
+	// with is whichever way its axis ran, so left alone the fold turns at
+	// random -- three of the four combinations cut the wall in a way its
+	// layers never asked for, and one of them drops the boundary along the
+	// whole length of the wall and keeps only the corner.
+	Handle(Geom_Surface) oriented_surface(const Handle(Geom_Surface)& s, const gp_Pnt& near, const gp_Vec& want) {
+		GeomAPI_ProjectPointOnSurf proj(near, s);
+		if (!proj.IsDone() || proj.NbPoints() == 0) {
+			return s;
+		}
+		double u, v;
+		proj.LowerDistanceParameters(u, v);
+		gp_Pnt p;
+		gp_Vec du, dv;
+		s->D1(u, v, p, du, dv);
+		const gp_Vec n = du ^ dv;
+		if (n.Magnitude() <= Precision::Confusion() || n.Dot(want) >= 0.) {
+			return s;
+		}
+		return s->UReversed();
+	}
+
+	// Give each interior boundary the neighbours' boundaries that continue it
+	// around a corner. Returns the number of folds made; nothing to fold is
+	// not a failure, it just means the wall is sliced as a wall on its own.
+	//
+	// The pairing is by thickness from the outside of the corner. Two walls
+	// meeting at an end have their layers reconciled there: the cladding on
+	// the outside of the corner runs on into the neighbour's cladding, and so
+	// on inwards, so our boundary a given distance in from the outer face
+	// continues as the neighbour's boundary the same distance in from theirs.
+	// Which end of a stack is the outer one is not in the file -- it is
+	// geometry -- and the neighbour's own direction answers it: the neighbour
+	// extends away from the junction, so the outside of the corner is the end
+	// of our stack that lies against that direction.
+	int fold_boundaries(open_cascade_kernel* kernel, const layerset_information& info,
+		const std::vector<Handle(Geom_Surface)>& surfaces,
+		const std::map<express::base, layerset_information>& neighbours, double eps,
+		std::vector<std::vector<Handle(Geom_Surface)>>& folded) {
+
+		folded.assign(surfaces.size(), std::vector<Handle(Geom_Surface)>());
+		for (size_t i = 0; i < surfaces.size(); ++i) {
+			folded[i].push_back(surfaces[i]);
+		}
+
+		std::vector<double> cum(1, 0.);
+		for (auto& t : info.thicknesses) {
+			cum.push_back(cum.back() + t);
+		}
+		if (cum.size() != surfaces.size() || cum.back() <= Precision::Confusion()) {
+			return 0;
+		}
+
+		gp_Pnt our_1, our_2;
+		if (!axis_end_points(kernel, info, our_1, our_2)) {
+			return 0;
+		}
+
+		int made = 0;
+		bool chosen = false;
+		gp_Vec chosen_inner;
+		gp_Pnt chosen_at;
+
+		for (auto& kv : neighbours) {
+			const layerset_information& other = kv.second;
+			if (other.layers.size() < 3 || other.layers.size() != other.thicknesses.size() + 1) {
+				continue;
+			}
+
+			gp_Trsf to_ours;
+			if (!relative_placement(info, other, to_ours)) {
+				continue;
+			}
+
+			gp_Pnt their_1, their_2;
+			if (!axis_end_points(kernel, other, their_1, their_2)) {
+				continue;
+			}
+			their_1.Transform(to_ours);
+			their_2.Transform(to_ours);
+
+			// Which ends meet is measured rather than taken from the
+			// connection type: a file that says ATSTART where the geometry
+			// says otherwise would fold the wrong end of the wall.
+			const gp_Pnt* ours[2] = { &our_1, &our_2 };
+			const gp_Pnt* theirs[2] = { &their_1, &their_2 };
+			int oi = 0, ti = 0;
+			double best = std::numeric_limits<double>::max();
+			for (int a = 0; a < 2; ++a) {
+				for (int b = 0; b < 2; ++b) {
+					const double d = ours[a]->Distance(*theirs[b]);
+					if (d < best) {
+						best = d;
+						oi = a;
+						ti = b;
+					}
+				}
+			}
+
+			// The junction has to be a junction. Walls whose axes stop short of
+			// one another by more than the wall is thick are not meeting at a
+			// corner, whatever the file says about them.
+			if (best > cum.back() * 2.) {
+				continue;
+			}
+
+			const gp_Pnt& junction = *ours[oi];
+			gp_Vec our_away(*ours[oi], *ours[1 - oi]);
+			gp_Vec their_away(*theirs[ti], *theirs[1 - ti]);
+			if (our_away.Magnitude() <= Precision::Confusion() || their_away.Magnitude() <= Precision::Confusion()) {
+				continue;
+			}
+			our_away.Normalize();
+			their_away.Normalize();
+
+			std::vector<double> our_score(surfaces.size());
+			bool scored = true;
+			for (size_t i = 0; i < surfaces.size() && scored; ++i) {
+				scored = score_along(surfaces[i], junction, their_away, our_score[i]);
+			}
+			if (!scored) {
+				continue;
+			}
+
+			// Two walls running on into one another have no corner: their
+			// directions are the same line, our stack does not spread out
+			// along theirs, and there is no outer end to pair from.
+			if (std::fabs(our_score.back() - our_score.front()) < cum.back() * .5) {
+				continue;
+			}
+
+			std::vector<Handle(Geom_Surface)> their_surfaces;
+			for (auto& layer : other.layers) {
+				Handle(Geom_Surface) s = boundary_surface(kernel, layer, eps);
+				if (s.IsNull()) {
+					their_surfaces.clear();
+					break;
+				}
+				their_surfaces.push_back(Handle(Geom_Surface)::DownCast(s->Transformed(to_ours)));
+			}
+			if (their_surfaces.size() != other.layers.size()) {
+				continue;
+			}
+
+			std::vector<double> their_cum(1, 0.);
+			for (auto& t : other.thicknesses) {
+				their_cum.push_back(their_cum.back() + t);
+			}
+
+			std::vector<double> their_score(their_surfaces.size());
+			for (size_t j = 0; j < their_surfaces.size() && scored; ++j) {
+				scored = score_along(their_surfaces[j], junction, our_away, their_score[j]);
+			}
+			if (!scored || std::fabs(their_score.back() - their_score.front()) < their_cum.back() * .5) {
+				continue;
+			}
+
+			const bool our_front_outer = our_score.front() < our_score.back();
+			const bool their_front_outer = their_score.front() < their_score.back();
+
+			// Across our own stack, from the face on the outside of this
+			// corner towards the far one. Every fold at this junction turns
+			// the same way about it.
+			gp_Pnt foot_first, foot_last;
+			if (!foot_on(surfaces.front(), junction, foot_first) || !foot_on(surfaces.back(), junction, foot_last)) {
+				continue;
+			}
+			gp_Vec inner(foot_first, foot_last);
+			if (!our_front_outer) {
+				inner.Reverse();
+			}
+			if (inner.Magnitude() <= Precision::Confusion()) {
+				continue;
+			}
+			inner.Normalize();
+
+			// A wall can be on the outside of the corner at one end and on the
+			// inside at the other -- a Z of three walls is the everyday case.
+			// Its boundaries would then have to turn both ways at once, which
+			// one surface cannot do, so the second junction is left unfolded
+			// rather than folded backwards.
+			if (chosen) {
+				if (inner.Dot(chosen_inner) <= 0.) {
+					continue;
+				}
+			} else {
+				chosen = true;
+				chosen_inner = inner;
+				chosen_at = junction;
+			}
+
+			const double tol = std::max(eps * 10., cum.back() * 1.e-3);
+
+			for (size_t i = 1; i + 1 < surfaces.size(); ++i) {
+				const double target = our_front_outer ? cum[i] : cum.back() - cum[i];
+
+				for (size_t j = 1; j + 1 < their_surfaces.size(); ++j) {
+					const double d = their_front_outer ? their_cum[j] : their_cum.back() - their_cum[j];
+					if (std::fabs(d - target) <= tol) {
+						// The fold keeps the boundary on its far side from the
+						// junction, so its normal has to point down the wall
+						// away from the corner.
+						folded[i].push_back(oriented_surface(their_surfaces[j], junction, our_away));
+						++made;
+						break;
+					}
+				}
+			}
+		}
+
+		// The boundary keeps the fold on its inner side, so where anything was
+		// folded the boundary's own normal has to point across the stack.
+		if (made > 0) {
+			for (size_t i = 1; i + 1 < surfaces.size(); ++i) {
+				if (folded[i].size() > 1) {
+					folded[i][0] = oriented_surface(folded[i][0], chosen_at, chosen_inner);
+				}
+			}
+		}
+
+		return made;
+	}
+
 	double total_volume(const std::vector<conversion_result>& items) {
 		double v = 0.;
 		for (auto& item : items) {
@@ -391,11 +717,100 @@ bool open_cascade_kernel::apply_layerset(std::vector<conversion_result>& items, 
 	return true;
 }
 
-bool open_cascade_kernel::apply_folded_layerset(std::vector<conversion_result>& items, const layerset_information& info, const std::map<express::base, layerset_information>&) {
-	// Folding the layers around the corner where two walls meet takes the
-	// neighbours' boundaries as well and is a feature of its own. Until it is
-	// written, a wall that has neighbours is sliced as though it had none,
-	// which differs only within a wall thickness of the junction -- and is
-	// what every such wall got before, minus the slicing.
-	return apply_layerset(items, info);
+bool open_cascade_kernel::apply_folded_layerset(std::vector<conversion_result>& items, const layerset_information& info, const std::map<express::base, layerset_information>& neighbours) {
+	if (info.layers.size() < 3 || info.layers.size() != info.styles.size() + 1) {
+		return false;
+	}
+
+	std::vector<Handle(Geom_Surface)> surfaces;
+	for (auto& layer : info.layers) {
+		auto s = boundary_surface(this, layer, precision_);
+		if (s.IsNull()) {
+			// Reported by the unfolded path, which cannot get past this either.
+			return apply_layerset(items, info);
+		}
+		surfaces.push_back(s);
+	}
+
+	std::vector<std::vector<Handle(Geom_Surface)>> folded;
+	const int made = fold_boundaries(this, info, surfaces, neighbours, precision_, folded);
+	if (made <= 0) {
+		// A wall whose neighbours turn out to fold nothing -- they meet it end
+		// on, or their layers line up with none of its own -- is a wall on its
+		// own as far as the geometry goes.
+		return apply_layerset(items, info);
+	}
+
+	// The same guard the unfolded path applies: a body that is not the
+	// thickness of its own layer set is not described by it, and dividing it
+	// hands back an outer piece that silently absorbs the rest.
+	std::vector<double> declared(1, 0.);
+	for (auto& t : info.thicknesses) {
+		declared.push_back(declared.back() + t);
+	}
+	const double band_tol = std::max(precision_ * 10., declared.back() * 1.e-3);
+
+	if (declared.size() == surfaces.size()) {
+		for (auto& item : items) {
+			double lo, hi;
+			std::string worst;
+			const TopoDS_Shape& shape = std::static_pointer_cast<open_cascade_shape>(item.shape())->shape();
+			if (!extent_across_layers(shape, surfaces.front(), lo, hi, &worst) ||
+				std::fabs(lo) > band_tol || std::fabs(hi - declared.back()) > band_tol) {
+				logger_.message(ifcopenshell::logger::LOG_WARNING, "GEO", 337,
+					"The body measures " + std::to_string(lo) + ".." + std::to_string(hi) +
+					" across its own layer boundaries, not 0.." + std::to_string(declared.back()) +
+					", so its material layer set does not describe it and it is left unsliced"
+					" [furthest point: " + worst + "]");
+				return false;
+			}
+		}
+	}
+
+	std::vector<taxonomy::style::ptr> styles;
+	for (auto& style : info.styles) {
+		styles.push_back(taxonomy::make<taxonomy::style>(style));
+	}
+
+	std::vector<conversion_result> sliced;
+	if (!util::apply_folded_layerset(items, folded, styles, sliced, precision_)) {
+		logger_.message(ifcopenshell::logger::LOG_WARNING, "GEO", 338,
+			"Unable to divide the body by " + std::to_string(made) +
+			" folded material layer boundaries, slicing it as a wall on its own instead");
+		return apply_layerset(items, info);
+	}
+
+	// The pieces are the body rearranged, so they still have to add up to it.
+	const double before = total_volume(items);
+	const double after = total_volume(sliced);
+	if (before <= 0. || std::fabs(after - before) > 1.e-3 * before) {
+		logger_.message(ifcopenshell::logger::LOG_WARNING, "GEO", 339,
+			"Folded material layer slices do not add up to the body they came from, slicing it as a wall on its own instead");
+		return apply_layerset(items, info);
+	}
+
+	// A folded piece is deliberately not one layer band -- that is what the
+	// fold is -- so it cannot be checked against a declared thickness the way
+	// an unfolded slice is. What still holds is that no piece may reach
+	// outside the layer set: the body was measured as 0..total above, and a
+	// piece that leaves that range is material the layer set never described.
+	for (auto& piece : sliced) {
+		double lo, hi;
+		std::string worst;
+		const TopoDS_Shape& shape = std::static_pointer_cast<open_cascade_shape>(piece.shape())->shape();
+		if (!extent_across_layers(shape, surfaces.front(), lo, hi, &worst) ||
+			lo < -band_tol || hi > declared.back() + band_tol) {
+			logger_.message(ifcopenshell::logger::LOG_WARNING, "GEO", 340,
+				"A folded material layer slice measures " + std::to_string(lo) + ".." + std::to_string(hi) +
+				" across the boundaries, which reaches outside the declared 0.." + std::to_string(declared.back()) +
+				", slicing the body as a wall on its own instead [furthest point: " + worst + "]");
+			return apply_layerset(items, info);
+		}
+	}
+
+	logger_.message(ifcopenshell::logger::LOG_NOTICE, "GEO", 341,
+		"The material layers were folded around " + std::to_string(made) + " boundary continuation(s) where this wall meets its neighbours");
+
+	items.swap(sliced);
+	return true;
 }

@@ -302,7 +302,14 @@ bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversio
 
 	NCollection_List<TopoDS_Shape> shells;
 
-	for (folded_surfaces_t::const_iterator it = surfaces.begin(); it != surfaces.end(); ++it) {
+	// The first and last boundaries are the wall's own faces: they order the
+	// slices but they do not divide anything, and they are never folded. This
+	// is the same contract apply_layerset works to, so that the reference
+	// boundary below is there to be read -- without it a two layer wall got an
+	// arbitrary order and came out with its materials swapped whenever it was
+	// folded.
+	for (size_t idx = 1; idx + 1 < surfaces.size(); ++idx) {
+		folded_surfaces_t::const_iterator it = surfaces.begin() + idx;
 		if (it->empty()) {
 			continue;
 		} else if (it->size() == 1) {
