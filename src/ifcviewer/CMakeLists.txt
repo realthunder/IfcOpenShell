@@ -247,7 +247,7 @@ if(EMSCRIPTEN)
     target_include_directories(IfcViewerCore PRIVATE ${ZSTD_DEC_DIR})
 else()
     find_package(zstd CONFIG REQUIRED)
-    target_link_libraries(IfcViewerCore PUBLIC zstd::libzstd_static)
+    target_link_libraries(IfcViewerCore PUBLIC $<IF:$<TARGET_EXISTS:ZSTD::ZSTD>,ZSTD::ZSTD,$<IF:$<TARGET_EXISTS:zstd::libzstd_static>,zstd::libzstd_static,$<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd>>>)
 endif()
 install(TARGETS IfcViewerCore EXPORT ${IFCOPENSHELL_EXPORT_TARGETS})
 
