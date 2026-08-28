@@ -21,11 +21,14 @@
 #include <string>
 
 #include <Bnd_Box.hxx>
+#include <BRepBndLib.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
 #include <GeomAPI_ProjectPointOnSurf.hxx>
 #include <GeomAdaptor_Surface.hxx>
 #include <gp_Pln.hxx>
+#include <Geom_Plane.hxx>
+#include <cstring>
 
 #include <BRepBuilderAPI_MakeShell.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
@@ -38,12 +41,19 @@
 #include <BOPAlgo_PaveFiller.hxx>
 #include <Standard_Version.hxx>
 #include <BRepCheck_Analyzer.hxx>
+#include <BRepExtrema_DistShapeShape.hxx>
 #include <ShapeFix_Shape.hxx>
 #include <NCollection_IncAllocator.hxx>
 
 using namespace ifcopenshell::geom;
 
 namespace {
+
+	double face_area(const TopoDS_Shape& f) {
+		GProp_GProps props;
+		BRepGProp::SurfaceProperties(f, props);
+		return props.Mass();
+	}
 
 	void subshapes(const TopoDS_Shape& in, std::list<TopoDS_Shape>& out) {
 		TopoDS_Iterator sit(in);
@@ -321,6 +331,11 @@ bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversio
 			shells.Append(BRepBuilderAPI_MakeShell(surface, u1, v1, u2, v2).Shell());
 		} else {
 			faces_with_mass_t solids;
+			// What each surface is and how each cut below changed it, kept so
+			// that a failed sew can say which faces never met. A cut that
+			// leaves a face whole still counts one face, so the na/nb checks
+			// alone cannot tell a real trim from a miss.
+			std::vector<std::string> kinds;
 			for (folded_surfaces_t::value_type::const_iterator jt = it->begin(); jt != it->end(); ++jt) {
 				const opencascade::handle<Geom_Surface>& surface = *jt;
 				double u1, v1, u2, v2;
@@ -334,6 +349,33 @@ bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversio
 				p1 = p.Translated(n);
 				p2 = p.Translated(-n);
 				solids.push_back(std::make_pair(face, std::make_pair(p1, p2)));
+
+				std::string k(surface->DynamicType()->Name());
+				const size_t us = k.rfind('_');
+				if (us != std::string::npos) {
+					k = k.substr(us + 1);
+				}
+				char buf[640];
+				snprintf(buf, sizeof(buf), "%s u=%.3f..%.3f v=%.3f..%.3f a=%.4f", k.c_str(), u1, u2, v1, v2, face_area(face));
+				if (auto gpln = opencascade::handle<Geom_Plane>::DownCast(surface)) {
+					const gp_Pnt& o = gpln->Position().Location();
+					const gp_Dir& d = gpln->Position().Direction();
+					const gp_Dir& xd = gpln->Position().XDirection();
+					char buf2[192];
+					snprintf(buf2, sizeof(buf2), " o=(%.3f,%.3f,%.3f) n=(%.3f,%.3f,%.3f) x=(%.3f,%.3f,%.3f)",
+						o.X(), o.Y(), o.Z(), d.X(), d.Y(), d.Z(), xd.X(), xd.Y(), xd.Z());
+					strncat(buf, buf2, sizeof(buf) - strlen(buf) - 1);
+				}
+				{
+					Bnd_Box fb;
+					BRepBndLib::Add(face, fb);
+					double x1, y1, z1, x2, y2, z2;
+					fb.Get(x1, y1, z1, x2, y2, z2);
+					char buf3[160];
+					snprintf(buf3, sizeof(buf3), " box=(%.3f,%.3f,%.3f)..(%.3f,%.3f,%.3f)", x1, y1, z1, x2, y2, z2);
+					strncat(buf, buf3, sizeof(buf) - strlen(buf) - 1);
+				}
+				kinds.push_back(buf);
 			}
 
 
@@ -351,6 +393,8 @@ bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversio
 				TopoDS_Face& B = jt->first;
 				TopoDS_Shape Bn = BRepPrimAPI_MakeHalfSpace(B, jt->second.second).Solid();
 
+				const double a_before = face_area(A), b_before = face_area(B);
+
 				TopoDS_Shape a = BRepAlgoAPI_Cut(A, Bn);
 				const int na = util::count(a, TopAbs_FACE);
 				if (na == 1) {
@@ -361,6 +405,14 @@ bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversio
 				const int nb = util::count(b, TopAbs_FACE);
 				if (nb == 1) {
 					B = TopoDS::Face(TopExp_Explorer(b, TopAbs_FACE).Current());
+				}
+
+				{
+					const size_t bi = jt - solids.begin();
+					char buf[96];
+					snprintf(buf, sizeof(buf), "; cut 0-%d: %.4f->%.4f / %.4f->%.4f",
+						(int)bi, a_before, face_area(A), b_before, face_area(B));
+					kinds[0] += buf;
 				}
 
 				// Either face left whole is a fold that did not turn: the two
@@ -388,11 +440,32 @@ bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversio
 			if (s.ShapeType() == TopAbs_SHELL) {
 				shells.Append(TopoDS::Shell(s));
 			} else {
+				// Which faces never meet: the smallest distance between each
+				// pair of the faces the sewer was given. A pair a long way
+				// apart was left untouched by a cut that was meant to trim it.
+				std::string gaps;
+				for (size_t gi = 0; gi < solids.size(); ++gi) {
+					for (size_t gj = gi + 1; gj < solids.size(); ++gj) {
+						BRepExtrema_DistShapeShape dss(solids[gi].first, solids[gj].first);
+						char buf[64];
+						if (dss.IsDone()) {
+							snprintf(buf, sizeof(buf), " %d-%d=%.4g", (int)gi, (int)gj, dss.Value());
+						} else {
+							snprintf(buf, sizeof(buf), " %d-%d=?", (int)gi, (int)gj);
+						}
+						gaps += buf;
+					}
+				}
+				std::string faces_detail;
+				for (size_t ki = 0; ki < kinds.size(); ++ki) {
+					faces_detail += (ki ? " | " : "") + std::to_string(ki) + ": " + kinds[ki];
+				}
 				ifcopenshell::logger::root().error("GEO", 172,
 					"Sewing " + std::to_string(solids.size()) + " surfaces of a folded layer boundary gave "
 					+ std::to_string(util::count(s, TopAbs_FACE)) + " face(s) that are not a shell"
 					+ (uncut ? ", " + std::to_string(uncut) + " of the pairs did not trim each other (" + detail + ")"
-					         : ", though every pair trimmed each other"));
+					         : ", though every pair trimmed each other")
+					+ " [" + faces_detail + "; gaps:" + gaps + "]");
 				return false;
 			}
 		}
