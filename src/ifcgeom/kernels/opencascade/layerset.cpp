@@ -341,6 +341,9 @@ bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversio
 				continue;
 			}
 
+			int uncut = 0;
+			std::string detail;
+
 			faces_with_mass_t::iterator jt = solids.begin();
 			TopoDS_Face& A = jt->first;
 			TopoDS_Shape An = BRepPrimAPI_MakeHalfSpace(A, jt->second.second).Solid();
@@ -349,17 +352,33 @@ bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversio
 				TopoDS_Shape Bn = BRepPrimAPI_MakeHalfSpace(B, jt->second.second).Solid();
 
 				TopoDS_Shape a = BRepAlgoAPI_Cut(A, Bn);
-				if (util::count(a, TopAbs_FACE) == 1) {
+				const int na = util::count(a, TopAbs_FACE);
+				if (na == 1) {
 					A = TopoDS::Face(TopExp_Explorer(a, TopAbs_FACE).Current());
 				}
 
 				TopoDS_Shape b = BRepAlgoAPI_Cut(B, An);
-				if (util::count(b, TopAbs_FACE) == 1) {
+				const int nb = util::count(b, TopAbs_FACE);
+				if (nb == 1) {
 					B = TopoDS::Face(TopExp_Explorer(b, TopAbs_FACE).Current());
+				}
+
+				// Either face left whole is a fold that did not turn: the two
+				// then cross instead of meeting, and the sew below cannot make
+				// a shell of them.
+				if (na != 1 || nb != 1) {
+					uncut += 1;
+					detail = "boundary cut into " + std::to_string(na) + " and fold into " + std::to_string(nb);
 				}
 			}
 
-			BRepOffsetAPI_Sewing builder;
+			// The kernel's own precision rather than the sewer's 1e-6 default,
+			// since the faces arrive from boolean cuts and agree only to the
+			// tolerance the rest of the conversion works to. Measured on King
+			// this changes nothing either way -- where the sew fails there the
+			// two faces are genuinely apart, not just out of tolerance -- so
+			// it is the right default, not a fix for that.
+			BRepOffsetAPI_Sewing builder(tol);
 			for (faces_with_mass_t::const_iterator kt = solids.begin(); kt != solids.end(); ++kt) {
 				builder.Add(kt->first);
 			}
@@ -369,7 +388,11 @@ bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversio
 			if (s.ShapeType() == TopAbs_SHELL) {
 				shells.Append(TopoDS::Shell(s));
 			} else {
-				ifcopenshell::logger::root().error("GEO", 172, "Expected shell type in layerset processing");
+				ifcopenshell::logger::root().error("GEO", 172,
+					"Sewing " + std::to_string(solids.size()) + " surfaces of a folded layer boundary gave "
+					+ std::to_string(util::count(s, TopAbs_FACE)) + " face(s) that are not a shell"
+					+ (uncut ? ", " + std::to_string(uncut) + " of the pairs did not trim each other (" + detail + ")"
+					         : ", though every pair trimmed each other"));
 				return false;
 			}
 		}
