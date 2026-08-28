@@ -16,7 +16,7 @@
 namespace ifcopenshell {
 
 namespace geom {
-    
+
     class POSTFIX_SCHEMA(mapping) : public abstract_mapping {
 	private:
 		ifcopenshell::file* file_;
@@ -30,7 +30,7 @@ namespace geom {
 		const express::base placement_rel_to_instance_;
 
 		Eigen::Matrix4d offset_and_rotation_ = Eigen::Matrix4d::Identity();
-		
+
 		// Units of each representation context that measures differently from
 		// the file-level ones, so geometry can be mapped in the units of the
 		// context it belongs to. Empty when every context agrees.
@@ -145,7 +145,7 @@ namespace geom {
 	template <>
 	struct element_type<taxonomy::solid> {
 		typedef taxonomy::shell type;
-	};	
+	};
 
 	template <typename U = taxonomy::collection, typename T>
 	typename U::ptr map_to_collection(POSTFIX_SCHEMA(mapping)* m, const T& ts) {

@@ -47,6 +47,7 @@
 #include <utility>
 #include <vector>
 
+#include "AxisIndicatorRenderer.h"
 #include "BufferPool.h"
 #include "InstanceCompose.h"
 #include "InstancedGeometry.h"
@@ -55,6 +56,7 @@
 #include "SectionPlane.h"
 #include "SelectionState.h"
 #include "SidecarCache.h"
+#include "Stopwatch.h"
 #include "StreamingLoader.h"
 #include "StreamingThread.h"
 #include "ViewportHost.h"
@@ -281,9 +283,9 @@ public:
     //
     // Pixel-delta camera moves, shared by every host (Qt desktop + web).
     // Hosts translate raw pointer/wheel events into these calls and own
-    // their own UI concerns (drag promotion, pivot indicator, cursor
-    // capture); the orbit math lives here so it can't drift between
-    // platforms. Each schedules a frame via the host.
+    // their own UI concerns (drag promotion, cursor capture); the orbit
+    // math lives here so it can't drift between platforms. Each schedules
+    // a frame via the host.
     //
     // orbitBy:  drag-right yaws the world right (yaw -= dx), drag-down
     //           tilts the camera up (pitch += dy). 0.4 deg/px matches GL.
@@ -295,6 +297,18 @@ public:
     void orbitBy(float dx_px, float dy_px);
     void panBy(float dx_px, float dy_px, int viewport_height_px);
     void dollyBy(float notches);
+
+    // ---- Pivot indicator ----------------------------------------------------
+    //
+    // The RGB triad drawn at the orbit target while the user navigates, so it's
+    // obvious what the camera is turning around. Hosts gate it: (true) when an
+    // orbit / pan drag starts, (false) when it ends. `hide_after_ms` > 0 arms an
+    // afterglow instead — the wheel path uses it so a zoom without a held drag
+    // still shows the pivot for a moment. State lives here (not in the host) so
+    // desktop and web behave identically; render() consults it each frame and
+    // keeps requesting frames until an armed afterglow expires.
+    void setPivotIndicatorVisible(bool visible, int hide_after_ms = 0);
+    bool pivotIndicatorVisible() const;
 
     // ---- First-person / fly navigation --------------------------------------
     //
@@ -530,8 +544,10 @@ public:
 
     // Per-model progress for a federation loading UI. count() is how many
     // models have metadata (are in the scene); progress(idx,…) gives the
-    // idx-th model's resident/total chunks, ordered by session_model_id (= load order)
-    // so each model keeps a stable UI slot as it streams.
+    // idx-th model's resident/total chunks, ordered by session_model_id — which
+    // is minted when a load is REQUESTED, so this is the order the host asked
+    // for its models, not the order their reads finished. Each model keeps a
+    // stable UI slot as it streams.
     int  streamingModelCount() const;
     void streamingModelProgress(int idx, int& resident_chunks,
                                 int& total_chunks) const;
@@ -542,11 +558,17 @@ public:
     int modelLoadIndex(std::uint32_t session_model_id) const;
 
     // One row of the element table: the IFC identity behind a rendered
-    // object_id. `model_index` is the load-order slot (modelLoadIndex), so a
-    // host UI can attribute an object to the file it came from.
+    // object_id, plus which model it came from, said two ways.
+    //
+    // `model_index` is the load-order slot (modelLoadIndex) — a POSITION, so it
+    // shifts if an earlier model fails to load. `source_id` is the JS byte-source
+    // the model was added from (-1 when it came from somewhere else), which the
+    // host minted itself and which never moves. Prefer the latter for
+    // attributing an object to a file; the index is for UI slots.
     struct ElementRef {
         std::uint32_t object_id   = 0;
         int           model_index = -1;
+        int           source_id   = -1;
         std::string   guid;
         std::string   name;
         std::string   type;
@@ -1030,9 +1052,10 @@ public:
 private:
     bool createPool();
 
-    // The scene's models in load order (ascending session_model_id). Every
-    // per-model API indexes against this, so a model keeps a stable UI slot
-    // instead of hopping with unordered_map iteration order.
+    // The scene's models in load order (ascending session_model_id, minted at
+    // request time — see loadSidecarMetadataWeb). Every per-model API indexes
+    // against this, so a model keeps a stable UI slot instead of hopping with
+    // unordered_map iteration order.
     std::vector<std::uint32_t> modelIdsInLoadOrder() const;
 
 public:
@@ -1092,6 +1115,14 @@ private:
     // Lifted out of the Qt-coupled OverlayRenderer so one identical gizmo draws
     // everywhere; the desktop's OverlayRenderer no longer draws it.
     SectionGizmoRenderer section_gizmo_;
+    // Corner axis gizmo + orbit pivot indicator, likewise shared by desktop +
+    // web. Same lift out of the Qt-coupled OverlayRenderer.
+    AxisIndicatorRenderer axis_indicator_;
+    bool                  pivot_indicator_visible_ = false;
+    // Only running while an afterglow is armed; a drag-held indicator leaves it
+    // invalid so the triad stays up until the host clears it.
+    Stopwatch             pivot_indicator_timer_;
+    int                   pivot_indicator_hide_ms_ = 0;
 
     // HiZ occlusion-cull pipeline group. Downsamples MSAA depth into a
     // mip pyramid; consumed by next-frame cull.

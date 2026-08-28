@@ -3,11 +3,13 @@ name: ci-ifctester-org
 on:
   workflow_dispatch:
   push:
+    branches:
+      - v0.9.0
     paths:
       - src/ifctester/**
 
 jobs:
-  publish_website:
+  publish_ifctester_org:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7

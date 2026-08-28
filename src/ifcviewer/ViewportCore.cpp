@@ -576,6 +576,21 @@ void ViewportCore::dollyBy(float notches) {
     host_->requestFrame();
 }
 
+void ViewportCore::setPivotIndicatorVisible(bool visible, int hide_after_ms) {
+    pivot_indicator_visible_ = visible;
+    pivot_indicator_hide_ms_ = hide_after_ms;
+    if (visible && hide_after_ms > 0) pivot_indicator_timer_.start();
+    else                              pivot_indicator_timer_.invalidate();
+    host_->requestFrame();
+}
+
+bool ViewportCore::pivotIndicatorVisible() const {
+    if (!pivot_indicator_visible_) return false;
+    // No armed afterglow means a drag is holding it up.
+    if (!pivot_indicator_timer_.isValid()) return true;
+    return pivot_indicator_timer_.elapsed() < pivot_indicator_hide_ms_;
+}
+
 void ViewportCore::flyMove(bool fwd, bool back, bool right, bool left,
                            bool up, bool down, bool boost, float dt_seconds) {
     if (dt_seconds <= 0.0f) return;
@@ -1297,6 +1312,10 @@ bool ViewportCore::buildPipelines() {
     // Section-plane gizmo (shared desktop + web). Optional — a failure just
     // means no gizmo, not a dead viewport.
     section_gizmo_.init(device_, queue_, surface_view_format_, kViewportSampleCount);
+
+    // Corner axis gizmo + orbit pivot indicator (shared desktop + web).
+    // Also optional: a failure costs the indicator, not the viewport.
+    axis_indicator_.init(device_, queue_, surface_view_format_, kViewportSampleCount);
     return true;
 }
 
@@ -1913,6 +1932,7 @@ void ViewportCore::shutdown() {
     if (main_pipeline_no_cull_)      { wgpuRenderPipelineRelease(main_pipeline_no_cull_);     main_pipeline_no_cull_ = nullptr; }
     if (main_pipeline_transparent_)  { wgpuRenderPipelineRelease(main_pipeline_transparent_); main_pipeline_transparent_ = nullptr; }
     section_gizmo_.destroy();
+    axis_indicator_.destroy();
     if (main_shader_module_)   { wgpuShaderModuleRelease(main_shader_module_);    main_shader_module_ = nullptr; }
     if (pipeline_layout_)      { wgpuPipelineLayoutRelease(pipeline_layout_);     pipeline_layout_ = nullptr; }
     if (model_bgl_)            { wgpuBindGroupLayoutRelease(model_bgl_);          model_bgl_ = nullptr; }
@@ -3878,10 +3898,24 @@ void ViewportCore::loadSidecarMetadataWeb(int source_id, std::string source_labe
         return;
     }
 
+    // Mint the session model id HERE, synchronously, rather than at the end of
+    // the read chain below. Session ids are what orders the scene's models —
+    // modelIdsInLoadOrder sorts by them, and every per-model slot a host sees
+    // (modelProgress's index, ElementRef::model_index) is a rank in that order.
+    // Minting on completion made that rank the order the models' network reads
+    // happened to finish in, so with several federated models in flight the
+    // slots came out shuffled against the order the host added them and a pick
+    // was attributed to the wrong file. Requesting order is the order the host
+    // asked for, which is the order it can reason about. A load that fails
+    // partway simply abandons its id — the ranks compact over whatever models
+    // made it into the scene, exactly as before.
+    const std::uint32_t session_model_id = next_session_model_id_++;
+
     // Head (v16): [header 12][geom_bytes 8]. The two compressed metadata blocks
     // follow the compressed geometry at SIDECAR_HEAD_BYTES + geom_bytes.
     webReadRangesAsync(source_id, 0, {{0, SIDECAR_HEAD_BYTES}},
-        [this, fsize, source_id, source_label, on_loaded = std::move(on_loaded)]
+        [this, fsize, source_id, source_label, session_model_id,
+         on_loaded = std::move(on_loaded)]
         (bool ok, std::vector<std::uint8_t>&& head) mutable {
             std::uint64_t geom_bytes = 0;
             if (!ok || !parseSidecarHead(head.data(), head.size(), geom_bytes)) {
@@ -3895,7 +3929,7 @@ void ViewportCore::loadSidecarMetadataWeb(int source_id, std::string source_labe
             }
             // Geometry metadata block on disk: [comp u64][raw u64][zstd frame].
             webReadRangesAsync(source_id, 0, {{meta_off, 16}},
-                [this, fsize, meta_off, source_id, source_label,
+                [this, fsize, meta_off, source_id, source_label, session_model_id,
                  on_loaded = std::move(on_loaded)]
                 (bool ok2, std::vector<std::uint8_t>&& h) {
                     if (!ok2 || h.size() < 16) {
@@ -3914,7 +3948,7 @@ void ViewportCore::loadSidecarMetadataWeb(int source_id, std::string source_labe
                         {{geometry_metadata_off, geometry_metadata_comp}},
                         [this, geometry_metadata_off, geometry_metadata_comp,
                          geometry_metadata_raw, source_id, source_label,
-                         on_loaded = std::move(on_loaded)]
+                         session_model_id, on_loaded = std::move(on_loaded)]
                         (bool ok3, std::vector<std::uint8_t>&& cz) {
                             if (!ok3) {
                                 Log::warn() << "loadSidecarMetadataWeb: geometry metadata read failed";
@@ -3951,7 +3985,7 @@ void ViewportCore::loadSidecarMetadataWeb(int source_id, std::string source_labe
                                 geometry_metadata_off + geometry_metadata_comp;
                             webReadRangesAsync(source_id, 0, {{element_metadata_hdr_off, 16}},
                                 [this, sc = std::move(sc), element_metadata_hdr_off,
-                                 source_id, source_label,
+                                 source_id, source_label, session_model_id,
                                  on_loaded = std::move(on_loaded)]
                                 (bool ok4, std::vector<std::uint8_t>&& dh) mutable {
                                     if (ok4 && dh.size() >= 16) {
@@ -3969,7 +4003,6 @@ void ViewportCore::loadSidecarMetadataWeb(int source_id, std::string source_labe
 
                                     const std::size_t n_meshes    = sc.meta.meshes.size();
                                     const std::size_t n_instances = sc.meta.instances.size();
-                                    const std::uint32_t session_model_id = next_session_model_id_++;
                                     applyCachedModel(session_model_id, std::move(sc));
                                     // Mark web-streamed + set the source IMMEDIATELY — the
                                     // model now has non-resident chunks and the RAF loop's
@@ -4071,11 +4104,14 @@ void ViewportCore::logSelectedObjectGuidWeb(std::uint32_t object_id) {
         }
         Log::info() << "pick: object " << object_id << " GUID " << e.guid;
         // Surface the selection to JS so host pages can react (e.g. show the
-        // GUID + model). Fires Module.__ifcvOnSelect(object_id, guid, modelIndex);
-        // model_index is the load-order slot, matching the JS model list.
+        // GUID + model). Fires
+        // Module.__ifcvOnSelect(object_id, guid, modelIndex, sourceId).
+        // modelIndex is the load-order slot; sourceId is the byte-source the
+        // host added the model from, which is the one that cannot shift.
         EM_ASM({
-            if (Module.__ifcvOnSelect) Module.__ifcvOnSelect($0, UTF8ToString($1), $2);
-        }, object_id, e.guid.c_str(), e.model_index);
+            if (Module.__ifcvOnSelect)
+                Module.__ifcvOnSelect($0, UTF8ToString($1), $2, $3);
+        }, object_id, e.guid.c_str(), e.model_index, e.source_id);
     });
 }
 #endif  // __EMSCRIPTEN__
@@ -4137,6 +4173,7 @@ ViewportCore::ElementRef makeElementRef(const ModelGpuData& m, int model_index,
     ViewportCore::ElementRef ref;
     ref.object_id   = e.object_id;
     ref.model_index = model_index;
+    ref.source_id   = m.web_source_id;
     ref.guid        = str(e.guid_offset, e.guid_length);
     ref.name        = str(e.name_offset, e.name_length);
     ref.type        = str(e.type_offset, e.type_length);
@@ -7606,8 +7643,15 @@ void ViewportCore::render() {
     section_gizmo_.encode(pass, vp_this_frame, section_planes_,
                           viewport_w_px, viewport_h_px, dpr_int, section_selected_index_);
 
-    // Remaining in-pass overlays (highlight triangles, pivot, overlay
-    // lines/points). QtViewportHost forwards to overlays_.X(); web host no-ops.
+    // Orbit pivot indicator — same shared-renderer story. Drawn while the host
+    // has it gated on (drag) or an afterglow is still running; in the latter
+    // case keep frames coming so the one that clears it actually lands.
+    const bool pivot_visible = pivotIndicatorVisible();
+    axis_indicator_.encodePivot(pass, overlay_frame, pivot_visible);
+    if (pivot_visible && pivot_indicator_timer_.isValid()) host_->requestFrame();
+
+    // Remaining in-pass overlays (highlight triangles, overlay lines/points).
+    // QtViewportHost forwards to overlays_.X(); the web host no-ops.
     host_->encodeOverlaysInMainPass(pass, overlay_frame);
 
     wgpuRenderPassEncoderEnd(pass);
@@ -7626,8 +7670,12 @@ void ViewportCore::render() {
     int hiz_submitted_slot = -1;
     if (hiz_enabled_) hiz_submitted_slot = encodeHizResolve(enc);
 
-    // Post-main overlays (corner axis, marquee, labels) on the resolved
-    // surface. QtViewportHost forwards to overlays_.X().
+    // Corner axis gizmo on the resolved surface — shared renderer, ahead of the
+    // host's own post-main overlays so marquee / labels still stack on top.
+    axis_indicator_.encodeCornerAxis(enc, view, overlay_frame);
+
+    // Remaining post-main overlays (marquee, labels) on the resolved surface.
+    // QtViewportHost forwards to overlays_.X(); the web host no-ops.
     host_->encodeOverlaysPostMain(enc, view, overlay_frame);
 
     // Optional capture: encode copy on the same command buffer.
