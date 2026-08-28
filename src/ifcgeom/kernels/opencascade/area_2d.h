@@ -32,6 +32,50 @@
 
 #include <libarea/Area.h>
 
+// libarea's kurve/geometry.h, reached through Area.h, defines a block of
+// unprefixed macros -- NONE, PI, CW, ACW, LINEAR, ORIGIN, TANGENT and the
+// rest -- and an installed header that does that poisons every translation
+// unit downstream of it. rocksdb/db.h is the one that found us:
+//
+//     enum class SizeApproximationFlags : uint8_t { NONE = 0, ... };
+//
+// becomes "0 = 0" as soon as this header is included first, so
+// layerset_offset.cpp stopped compiling the moment the build actually found
+// libarea. Nothing here uses any of them (checked, not assumed), so they are
+// dropped at the door rather than left for the next includer to trip over.
+// The real fix belongs upstream in libarea, where NONE in particular is dead
+// code, but this header is the boundary we control.
+#undef PI
+#undef DegreesToRadians
+#undef RadiansToDegrees
+#undef NEARLY_ONE
+#undef CPTANGENTTOL
+#undef TANTO
+#undef ANTITANTO
+#undef TANGENT
+#undef NEARINT
+#undef FARINT
+#undef LEFTINT
+#undef RIGHTINT
+#undef CFILLET
+#undef CHAMFER
+#undef GEOFF_LEFT
+#undef NONE
+#undef GEOFF_RIGHT
+#undef LINEAR
+#undef ACW
+#undef CW
+#undef INVALID_POINT
+#undef INVALID_POINT3D
+#undef INVALID_CLINE
+#undef INVALID_CIRCLE
+#undef ORIGIN
+#undef NULL_VECTOR
+#undef Z_VECTOR
+#undef Y_VECTOR
+#undef X_VECTOR
+#undef HORIZ_CLINE
+
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Wire.hxx>
 #include <gp_Ax3.hxx>
