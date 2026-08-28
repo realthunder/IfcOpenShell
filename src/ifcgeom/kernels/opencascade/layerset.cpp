@@ -302,7 +302,7 @@ namespace {
 }
 
 
-bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversion_result>& items, const std::vector< std::vector<opencascade::handle<Geom_Surface>>>& surfaces, const std::vector<ifcopenshell::geom::taxonomy::style::ptr>& styles, std::vector<conversion_result>& result, double tol) {
+bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversion_result>& items, const std::vector< std::vector<opencascade::handle<Geom_Surface>>>& surfaces, const std::vector<ifcopenshell::geom::taxonomy::style::ptr>& styles, std::vector<conversion_result>& result, double tol, double widen) {
 	Bnd_Box bb;
 	TopoDS_Shape input;
 	flatten_shape_list(items, input, false, false, tol);
@@ -325,7 +325,7 @@ bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversio
 		} else if (it->size() == 1) {
 			const opencascade::handle<Geom_Surface>& surface = (*it)[0];
 			double u1, v1, u2, v2;
-			if (!project(surface, input, u1, v1, u2, v2)) {
+			if (!project(surface, input, u1, v1, u2, v2, widen)) {
 				continue;
 			}
 			shells.Append(BRepBuilderAPI_MakeShell(surface, u1, v1, u2, v2).Shell());
@@ -337,9 +337,16 @@ bool ifcopenshell::geom::util::apply_folded_layerset(const std::vector<conversio
 			// alone cannot tell a real trim from a miss.
 			std::vector<std::string> kinds;
 			for (folded_surfaces_t::value_type::const_iterator jt = it->begin(); jt != it->end(); ++jt) {
+				// The fold surfaces continue this boundary inside a
+				// neighbour, so they lie beyond this wall's own body -- by up
+				// to the axis gap the junction guard allows plus the
+				// neighbour's stack. The default reach of a tenth of a unit
+				// left every deeper fold plane just out of range: the face
+				// stopped short of it, both half space cuts were no-ops, and
+				// the sew below reported honestly that the pieces were apart.
 				const opencascade::handle<Geom_Surface>& surface = *jt;
 				double u1, v1, u2, v2;
-				if (!project(surface, input, u1, v1, u2, v2)) {
+				if (!project(surface, input, u1, v1, u2, v2, widen)) {
 					continue;
 				}
 				TopoDS_Face face = BRepBuilderAPI_MakeFace(surface, u1, u2, v1, v2, 1.e-7).Face();

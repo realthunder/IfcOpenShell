@@ -773,7 +773,11 @@ bool open_cascade_kernel::apply_folded_layerset(std::vector<conversion_result>& 
 	}
 
 	std::vector<conversion_result> sliced;
-	if (!util::apply_folded_layerset(items, folded, styles, sliced, precision_)) {
+	// How far past the body a paired fold plane can legitimately sit: the
+	// junction guard accepts axis ends up to twice the stack apart, and the
+	// neighbour's boundary lies at most a stack deep beyond that.
+	const double reach = std::max(0.1, declared.back() * 3.);
+	if (!util::apply_folded_layerset(items, folded, styles, sliced, precision_, reach)) {
 		logger_.message(ifcopenshell::logger::LOG_WARNING, "GEO", 338,
 			"Unable to divide the body by " + std::to_string(made) +
 			" folded material layer boundaries, slicing it as a wall on its own instead");
