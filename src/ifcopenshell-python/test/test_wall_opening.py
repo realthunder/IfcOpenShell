@@ -184,7 +184,16 @@ class TestWallOpenings:
             [(1, "Processed fully in 2D")],
             [(1, "Intersecting boundaries")],
             [(1, "Intersecting boundaries")],
-            [(1, "No second operands can be processed as 2D inner bounds"), (0, "Operand B creates a through hole")],
+            # Recesses: 0.1 deep into a 0.2 wall. Upstream cannot take
+            # these as 2D inner bounds and says so; this fork splits the
+            # wall at the recess depth and does the subtraction in 2D on
+            # the front slab, leaving the back slab solid. Same geometry
+            # either way -- volume 11.464688 and an identical mesh with
+            # boolean-attempt-2d-area on or off, against 11.464381 for
+            # ideal circles -- so what changed is the route, not the
+            # result. The through-hole clause is the one guarding the
+            # geometry, and it still holds.
+            [(1, "Processed fully in 2D"), (0, "Operand B creates a through hole")],
             [(0, "Operand B 1/6 is an extrusion")],
             [(1, "Subtraction operand contained in other"), (0, "Subtraction operand outside of outer bound")],
             [],  # [(1, "Subtraction operand outside of outer bound")],
