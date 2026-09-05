@@ -287,6 +287,15 @@ std::vector<std::filesystem::path> ifcopenshell::plugin::manager::discover_exact
 
 ifcopenshell::plugin::module ifcopenshell::plugin::manager::load(const std::filesystem::path& path) const {
 	plugin_debug("load " + path_string(path));
+	// Never hand a directory (or anything else that is not a plain file) to
+	// boost::dll: it surfaces as an opaque loader message -- on Linux
+	// "cannot read file data: Is a directory" -- that names the search path
+	// and gives no clue which plug-in family asked for it.
+	std::error_code regular_file_error;
+	if (!std::filesystem::is_regular_file(path, regular_file_error)) {
+		plugin_debug("load refused, not a regular file: " + path_string(path));
+		throw std::runtime_error("Plugin path is not a regular file: " + path_string(path));
+	}
 #ifdef _WIN32
 	dll_error_mode_guard error_mode_guard;
 	const auto load_mode = boost::dll::load_mode::load_with_altered_search_path;

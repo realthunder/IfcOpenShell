@@ -21,6 +21,7 @@
 
 #include "express.h"
 
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <set>
@@ -226,7 +227,17 @@ void ifcopenshell::load_schema_plugins(schema_registry& registry) {
 	plugin::add_search_paths_or_default(manager, &schema_plugin_directory);
 
 	for (const auto& path : manager.discover(schema_plugin_prefix)) {
-		auto module = manager.load(path);
+		plugin::module module;
+		try {
+			module = manager.load(path);
+		} catch (const std::exception& e) {
+#ifdef IFOPSH_PLUGIN_DEBUG
+			std::cerr << "[ifcopenshell.plugin] skip schema plugin " << path << ": " << e.what() << std::endl;
+#else
+			static_cast<void>(e);
+#endif
+			continue;
+		}
 		if (module.meta().kind_ != plugin::kind::parse_schema) {
 			continue;
 		}
@@ -280,7 +291,19 @@ std::vector<std::string> ifcopenshell::schema_registry::names() {
 	plugin::manager manager;
 	plugin::add_search_paths_or_default(manager, &schema_plugin_directory);
 	for (const auto& path : manager.discover(schema_plugin_prefix)) {
-		auto module = manager.load(path);
+		plugin::module module;
+		try {
+			module = manager.load(path);
+		} catch (const std::exception& e) {
+			// Enumerating the schemas must not be fatal because one
+			// candidate would not load; kernel discovery already skips.
+#ifdef IFOPSH_PLUGIN_DEBUG
+			std::cerr << "[ifcopenshell.plugin] skip schema plugin " << path << ": " << e.what() << std::endl;
+#else
+			static_cast<void>(e);
+#endif
+			continue;
+		}
 		if (module.meta().kind_ == plugin::kind::parse_schema && !module.meta().schema.empty()) {
 			seen.insert(schema_key(module.meta().schema));
 		}
