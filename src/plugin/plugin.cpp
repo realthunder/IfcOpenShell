@@ -372,7 +372,15 @@ PLUGIN_API std::filesystem::path ifcopenshell::plugin::add_search_paths_or_defau
 	// install location. This also covers Python installations outside the CMake
 	// prefix, such as GitHub Actions' hosted Python.
 #ifdef IFCOPENSHELL_INSTALL_PLUGIN_DIRECTORY
-	const auto install_plugin_directory = std::filesystem::path(IFCOPENSHELL_INSTALL_PLUGIN_DIRECTORY);
+	// Relocatable packages (conda) rewrite this literal in the binary to a
+	// shorter prefix and pad the rest with NULs. The compiler folds the
+	// length of a literal, so std::string(LITERAL) would keep the padding
+	// as part of the path: it survives exists() and directory_iterator(),
+	// which only see the C string, and the candidates it yields then all
+	// truncate to the directory itself at dlopen(). Read the literal
+	// through a volatile pointer so its length is measured at run time.
+	const char* volatile install_plugin_directory_literal = IFCOPENSHELL_INSTALL_PLUGIN_DIRECTORY;
+	const auto install_plugin_directory = std::filesystem::path(std::string(install_plugin_directory_literal));
 	if (install_plugin_directory != path && std::filesystem::exists(install_plugin_directory)) {
 		manager.add_search_path(install_plugin_directory);
 	}
