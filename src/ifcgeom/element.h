@@ -34,6 +34,12 @@
 
 namespace ifcopenshell::geom {
 
+	// Declared before element's `friend class iterator`, which is otherwise an
+	// unqualified name MSVC binds to std::iterator (pulled in via <algorithm>/
+	// <memory>) and then rejects: C2990, a class template redeclared as a
+	// non-template class. tree.h carries the same forward declaration.
+	class iterator;
+
 	class transformation {
 	private:
 		ifcopenshell::geom::settings settings_;
