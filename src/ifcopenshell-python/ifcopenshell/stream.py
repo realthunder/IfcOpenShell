@@ -159,17 +159,29 @@ try:
             exclude = set()
 
             offset = 0
+            encoding = self.file.encoding
             for line in self.file:
-                # Advance by the raw line, terminator included. The file is
-                # opened with newline="" so nothing has translated that
-                # terminator away. len(os.linesep) used to stand in for its
-                # width, which is a guess at the writer's platform: it is wrong
-                # by one byte per line for any file whose endings are not this
-                # platform's, and .ifc is a `text` file in .gitattributes, so a
-                # checkout hands us either kind. The error accumulates, and a
-                # wrong offset silently returns a different entity.
+                # Advance by the raw line's length in BYTES, terminator
+                # included: these offsets are fed to seek(), which counts
+                # bytes, while this loop sees decoded characters. Two ways
+                # that used to go wrong, both accumulating, both ending in a
+                # seek that lands mid-record so a later read silently returns
+                # a different entity.
+                #
+                # The terminator: the file is opened with newline="" so
+                # nothing translates it away. len(os.linesep) used to stand in
+                # for its width, which is a guess at the writer's platform --
+                # wrong by one byte per line for any file whose endings are
+                # not this platform's, and .ifc is a `text` file in
+                # .gitattributes, so a checkout hands us either kind.
+                #
+                # The characters: under a multi-byte codec a non-ASCII line
+                # costs more bytes than it has characters. isascii() is an
+                # O(1) flag check in CPython, so conforming files pay almost
+                # nothing for the encode -- SPF escapes non-ASCII as \X2\, so
+                # only non-conforming ones take the slow path at all.
                 line_offset = offset
-                offset += len(line)
+                offset += len(line) if line.isascii() else len(line.encode(encoding))
                 line = line.strip()
                 if line.startswith("#"):
                     step_id, ifc_class = line.split("(")[0].split("=")

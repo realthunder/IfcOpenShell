@@ -16,6 +16,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with IfcOpenShell.  If not, see <http://www.gnu.org/licenses/>.
 
+import locale
 from pathlib import Path
 
 import pytest
@@ -52,7 +53,7 @@ class TestEntity:
         assert element.Name == "My Project"
 
 
-class TestLineEndings:
+class TestOffsets:
     @pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"], ids=["lf", "crlf"])
     def test_offsets_follow_the_file_not_the_platform(self, tmp_path, line_ending):
         # The stream reader seeks by byte offset, so it has to measure the
@@ -72,5 +73,36 @@ class TestLineEndings:
         assert str(element) == "#1=IFCPROJECT('3kv235yMjDO9tHiTzD8QuS',$,'My Project',$,$,$,$,(#14,#26),#9);"
         assert element.Name == "My Project"
 
+        for step_id in stream_file.id_map:
+            assert str(stream_file.by_id(step_id)).startswith(f"#{step_id}=")
+
+    def test_offsets_count_bytes_not_characters(self, tmp_path):
+        # The offsets are fed to seek(), which counts bytes, while the index
+        # loop sees decoded characters. Under a multi-byte codec a non-ASCII
+        # line costs more bytes than it has characters, and every record after
+        # it reads at the wrong place. Build the file in the encoding the
+        # reader will actually open it with, so this holds under any locale --
+        # under a single-byte codec characters are bytes and there is nothing
+        # to drift. The name is escaped rather than literal so this source
+        # stays ASCII and cannot itself be mangled by a re-encoding.
+        encoding = locale.getpreferredencoding(False)
+        name = "Caf\u00e9 \u00dcberbau"
+        try:
+            name.encode(encoding)
+        except UnicodeEncodeError:
+            pytest.skip(f"{encoding} cannot represent the test name")
+
+        source = TEST_FILE.read_bytes().replace(b"\r\n", b"\n").decode("ascii")
+        path = tmp_path / "nonascii.ifc"
+        path.write_bytes(source.replace("My Project", name).encode(encoding))
+
+        stream_file: ifcopenshell.stream
+        stream_file = ifcopenshell.open(path, should_stream=True)
+
+        assert (element := stream_file.by_id(1))
+        assert element.Name == name
+
+        # The drift starts at the line after the non-ASCII one, so the first
+        # record proves nothing on its own.
         for step_id in stream_file.id_map:
             assert str(stream_file.by_id(step_id)).startswith(f"#{step_id}=")
