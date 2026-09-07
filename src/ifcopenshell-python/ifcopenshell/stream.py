@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 try:
-    import os
     import re
     from typing import Any, NoReturn, Optional, Union
 
@@ -101,7 +100,7 @@ try:
 
             self.filepath = filepath
 
-            self.file = open(filepath, "r")
+            self.file = open(filepath, "r", newline="")
             self.id_map: dict[int, str] = {}
             self.class_map: dict[str, list[int]] = {}
             self.id_offset: dict[int, int] = {}
@@ -160,8 +159,17 @@ try:
             exclude = set()
 
             offset = 0
-            newline_character = len(os.linesep)
             for line in self.file:
+                # Advance by the raw line, terminator included. The file is
+                # opened with newline="" so nothing has translated that
+                # terminator away. len(os.linesep) used to stand in for its
+                # width, which is a guess at the writer's platform: it is wrong
+                # by one byte per line for any file whose endings are not this
+                # platform's, and .ifc is a `text` file in .gitattributes, so a
+                # checkout hands us either kind. The error accumulates, and a
+                # wrong offset silently returns a different entity.
+                line_offset = offset
+                offset += len(line)
                 line = line.strip()
                 if line.startswith("#"):
                     step_id, ifc_class = line.split("(")[0].split("=")
@@ -169,7 +177,6 @@ try:
                     ifc_class = ifc_class.strip()
 
                     if ifc_class in exclude:
-                        offset += len(line) + newline_character
                         continue
 
                     for reference_id in self.reference_pattern.findall(line[1:]):
@@ -177,7 +184,7 @@ try:
 
                     self.id_map[step_id] = ifc_class
                     self.class_map.setdefault(ifc_class, []).append(step_id)
-                    self.id_offset[step_id] = offset
+                    self.id_offset[step_id] = line_offset
                 elif line.startswith("FILE_SCHEMA"):
                     self._schema = line.split("'")[1]
                     self.ifc_schema = ifcopenshell.schema_by_name(self.schema)
@@ -189,8 +196,6 @@ try:
                     self.shadow_file = ifcopenshell.file(schema=self.schema)
                     # But we only create them once per type because we basically only need access to 'semi-static' such as get_attribute_category()
                     self.instance_map = {}
-
-                offset += len(line) + newline_character
 
             self.preprocess_schema()
 

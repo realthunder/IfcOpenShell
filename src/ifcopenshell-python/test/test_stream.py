@@ -18,6 +18,8 @@
 
 from pathlib import Path
 
+import pytest
+
 import ifcopenshell
 
 TEST_FILE = Path(__file__).parent / "files" / "basic.ifc"
@@ -48,3 +50,27 @@ class TestEntity:
         stream_file = ifcopenshell.open(TEST_FILE, should_stream=True)
         assert (element := stream_file.by_id(1))
         assert element.Name == "My Project"
+
+
+class TestLineEndings:
+    @pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+    def test_offsets_follow_the_file_not_the_platform(self, tmp_path, line_ending):
+        # The stream reader seeks by byte offset, so it has to measure the
+        # file's own line terminator. .ifc is a `text` file in .gitattributes,
+        # so TEST_FILE reaches a checkout with whichever ending that platform
+        # normalizes to -- write both here rather than trusting it. Reading a
+        # record at the wrong offset returns a different entity silently, and
+        # the drift grows by one byte per line, so check every record.
+        source = TEST_FILE.read_bytes().replace(b"\r\n", b"\n")
+        path = tmp_path / "basic.ifc"
+        path.write_bytes(source.replace(b"\n", line_ending))
+
+        stream_file: ifcopenshell.stream
+        stream_file = ifcopenshell.open(path, should_stream=True)
+
+        assert (element := stream_file.by_id(1))
+        assert str(element) == "#1=IFCPROJECT('3kv235yMjDO9tHiTzD8QuS',$,'My Project',$,$,$,$,(#14,#26),#9);"
+        assert element.Name == "My Project"
+
+        for step_id in stream_file.id_map:
+            assert str(stream_file.by_id(step_id)).startswith(f"#{step_id}=")
